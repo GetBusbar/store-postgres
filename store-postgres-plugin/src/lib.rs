@@ -24,9 +24,14 @@ fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     } else {
         serde_json::from_str(cfg).map_err(|e| format!("invalid postgres plugin config: {e}"))?
     };
-    let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
-        "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
-    })?;
+    let url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
+        })?;
     let store = PostgresStore::connect(url).map_err(|e| e.0)?;
     Ok(Box::new(store))
 }
