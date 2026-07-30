@@ -2,15 +2,15 @@
 # supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
 # THIS repo's own GitHub Release.
 #
-# This mirrors busbarAI/.github/workflows/release.yml's `store-plugins` job — same 5-target
-# matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
-# BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
-# attestation — just scoped to this one plugin instead of building sqlite/postgres/redis together
-# in one monorepo job.
+# Same 5-target matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar
+# checkout), same BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` +
+# build-provenance attestation pattern busbar's own plugins use — but every plugin (including this
+# one) now releases from its own repo; busbarAI no longer has a combined `store-plugins` release
+# job to mirror.
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
 # it is independently versioned starting at 0.5.0 (see README), separate from whichever busbar
-# branch it happens to build against via BUSBAR_REF below.
+# commit it happens to build against via BUSBAR_REF below.
 name: release
 
 on:
@@ -24,10 +24,15 @@ permissions:
   attestations: write  # record the build-provenance attestation
 
 env:
-  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
-  # ci.yml / plugin-ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
-  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
-  BUSBAR_REF: 1.5.0-dev
+  # Which busbar commit to check out as the sibling path dependency (used only to build
+  # busbar-plugin-pack, which then packs + signs this plugin under BUSBAR_SIGN_KEY) — same
+  # BUSBAR_REF convention ci.yml / plugin-ci.yml already established. Pinned to a commit SHA on
+  # the 1.5.0-dev branch, not the branch name itself, since a mutable branch checked out while
+  # holding the signing key is a supply-chain foot-gun. To bump deliberately: confirm the new SHA
+  # builds busbar-plugin-pack cleanly, then update this value in a reviewed PR — never track the
+  # branch automatically. Update to a `main` SHA once busbar 1.5.0 actually ships; until then the
+  # plugin ABI surface this crate depends on only exists on 1.5.0-dev.
+  BUSBAR_REF: ddc97f1e337098d6b3b8f6cba32573cf2d652d5f # 1.5.0-dev, as of 2026-07-30
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
@@ -40,11 +45,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
+          set -euo pipefail
+          if ! out=$(gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "busbar-store-postgres ${GITHUB_REF_NAME}" \
-            --verify-tag --generate-notes \
-          || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+            --verify-tag --generate-notes 2>&1); then
+            if echo "$out" | grep -qi "already exists"; then
+              echo "$out"
+              echo "Release ${GITHUB_REF_NAME} already exists — reusing it (parallel matrix re-run or race)."
+              gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+            else
+              echo "$out" >&2
+              exit 1
+            fi
+          else
+            echo "$out"
+          fi
 
   # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
   # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
@@ -126,7 +142,7 @@ jobs:
           lib="store-postgres/target/${target}/release/${{ matrix.libprefix }}busbar_store_postgres_plugin.${{ matrix.libext }}"
           "$pack" pack \
             --lib "$lib" \
-            --name "busbar-store-postgres" --alias "postgres" --kind store \
+            --name "busbar-store-postgres-plugin" --alias "postgres" --kind store \
             --version "$ver" --publisher busbar \
             --description "First-party signed kind:store plugin cdylib: the Postgres backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set store.module: postgres to share virtual keys, budgets, and usage across a fleet of busbar nodes." \
             --license Apache-2.0 \
