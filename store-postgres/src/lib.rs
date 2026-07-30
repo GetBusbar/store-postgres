@@ -258,8 +258,43 @@ impl PostgresStore {
         self.client.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// A fixed, arbitrary-but-stable `pg_advisory_lock` key scoping every `migrate()` call across
+    /// every process/connection that ever opens this crate's schema. See `migrate()`'s doc comment
+    /// for why this exists.
+    const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p", picked for stability/legibility only
+
     fn migrate(&self) -> StoreResult<()> {
         let mut client = self.lock();
+        // CONCURRENCY (session-level advisory lock): `CREATE TABLE IF NOT EXISTS` is idempotent
+        // PER STATEMENT but NOT atomic under CONCURRENT DDL - two sessions can both see a table as
+        // "missing" and both attempt to create it; one loses a race on the table's implicit row
+        // type and fails with "duplicate key value violates unique constraint
+        // pg_type_typname_nsp_index" rather than a clean no-op. This is routine here: multiple
+        // independent processes (this crate's own live-DB unit test AND the plugin adapter's
+        // dlopen e2e test, run concurrently by `cargo test --workspace`, or simply two nodes
+        // booting against a fresh database at once in production) can all call `connect()` ->
+        // `migrate()` against the SAME database at the SAME time. `pg_advisory_lock` makes the
+        // whole migrate body single-flight across every concurrent connection: the first caller
+        // performs the CREATEs, every other caller blocks here until it's done and then finds the
+        // schema already at its target version (a cheap, correct no-op). Released in every exit
+        // path below, including error paths, so a failed migrate never wedges other connections.
+        client
+            .batch_execute(&format!(
+                "SELECT pg_advisory_lock({})",
+                Self::MIGRATE_LOCK_KEY
+            ))
+            .store()?;
+        let result = Self::migrate_locked(&mut client);
+        // Always release, even on error - never leave the lock held because migrate_locked bailed.
+        let _ = client.batch_execute(&format!(
+            "SELECT pg_advisory_unlock({})",
+            Self::MIGRATE_LOCK_KEY
+        ));
+        result
+    }
+
+    /// The actual migration body, run while holding `MIGRATE_LOCK_KEY` (see `migrate()`).
+    fn migrate_locked(client: &mut Client) -> StoreResult<()> {
         // SCHEMA-VERSION BUMP (v4, the 1.5.0 billable-requests ledger split; see SCHEMA_VERSION). A
         // pre-v4 database - one that still carries the legacy `usage_counters` table, or a
         // `virtual_keys` with the old inline-limit columns, or a `usage_windows` without
