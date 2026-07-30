@@ -1,20 +1,5 @@
-# Build, test, lint, and format-check the store-postgres plugin cdylib on every push/PR.
-#
-# This crate depends on busbar (../busbarAI, a local path dependency — see the README's
-# "Dependencies" section). The busbar repo (GetBusbar/busbar) is public, but 1.5.0's plugin work
-# (this crate's actual dependency surface — plugin-sdk, plugin-loader, api, store-postgres) isn't on
-# `main` yet (still pre-release); it lives on the `1.5.0-dev` branch instead, checked out here with no
-# token needed since the repo itself is public. Update BUSBAR_REF once 1.5.0 ships and this can just
-# track `main`.
-#
-# UNLIKE a kind:hook plugin, this store's only meaningful coverage is against a REAL Postgres — there
-# is no useful mock for "did the SQL actually persist." A `postgres:16` GitHub Actions service
-# container runs on every push (native `services:`, not a manual `docker run`), with a health check so
-# the job WAITS for it to accept connections instead of racing it. `BUSBAR_TEST_POSTGRES_URL` points
-# the test step at it. Both this crate's own tests/e2e.rs AND busbar-store-postgres's own
-# roundtrip_against_live_postgres test (in the sibling busbarAI checkout, reached via a workspace-wide
-# `cargo test` inside busbarAI) read that var and HARD-FAIL (not silently skip) when `CI` is set and
-# it's unset — so this coverage can never quietly vanish.
+# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
+# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
 name: ci
 
 on:
@@ -23,66 +8,12 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  BUSBAR_REF: 1.5.0-dev
-
 jobs:
-  test:
-    name: build, test, clippy, fmt
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: busbar
-          POSTGRES_PASSWORD: busbar
-          POSTGRES_DB: busbar_test
-        ports:
-          - 5432:5432
-        # Wait until the DB accepts connections before the job's steps run.
-        options: >-
-          --health-cmd "pg_isready -U busbar"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - name: Checkout store-postgres
-        uses: actions/checkout@v4
-        with:
-          path: store-postgres
-
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
-          path: busbarAI
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: cargo fmt --check
-        working-directory: store-postgres
-        run: cargo fmt --all -- --check
-
-      - name: cargo build
-        working-directory: store-postgres
-        run: cargo build --all-targets
-
-      - name: cargo clippy
-        working-directory: store-postgres
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: cargo test (this crate's own dlopen-against-real-Postgres ABI test)
-        working-directory: store-postgres
-        env:
-          BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
-        run: cargo test
-
-      - name: cargo test (busbar-store-postgres's own live-Postgres roundtrip, from the sibling checkout)
-        working-directory: busbarAI
-        env:
-          BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
-        run: cargo test -p busbar-store-postgres
+  ci:
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@1.5.0-dev
+    with:
+      plugin_crate: busbar-store-postgres-plugin
+      plugin_kind: store
+      plugin_alias: postgres
+      service: postgres
+      extra_sibling_test_command: cargo test -p busbar-store-postgres
