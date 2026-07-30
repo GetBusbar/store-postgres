@@ -1,0 +1,149 @@
+# Release: on a version tag (e.g. v1.0.0), build the store-postgres plugin cdylib for all 5
+# supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
+# THIS repo's own GitHub Release.
+#
+# This mirrors busbarAI/.github/workflows/release.yml's `store-plugins` job — same 5-target
+# matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
+# BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
+# attestation — just scoped to this one plugin instead of building sqlite/postgres/redis together
+# in one monorepo job.
+#
+# This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
+# it is independently versioned starting at 0.5.0 (see README), separate from whichever busbar
+# branch it happens to build against via BUSBAR_REF below.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write      # create the Release + upload assets
+  id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
+  attestations: write  # record the build-provenance attestation
+
+env:
+  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
+  # ci.yml / plugin-ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
+  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
+  BUSBAR_REF: 1.5.0-dev
+
+jobs:
+  # Create the Release first so the parallel per-target upload jobs have something to attach to
+  # (uploading from a matrix without a pre-existing release races -> "release not found").
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "busbar-store-postgres ${GITHUB_REF_NAME}" \
+            --verify-tag --generate-notes \
+          || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+
+  # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
+  # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
+  # first-party against the PUBLIC key embedded in busbar's own release binaries. If that secret
+  # isn't provisioned on this repo, falls back to an UNSIGNED tarball (loadable only under
+  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbarAI's own
+  # release.yml documents (TODO(release-keys)).
+  store-plugin:
+    needs: create-release
+    name: store-plugin (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            libext: so
+            libprefix: lib
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            libext: so
+            libprefix: lib
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            libext: dll
+            libprefix: ""
+    steps:
+      - name: Checkout store-postgres
+        uses: actions/checkout@v7
+        with:
+          path: store-postgres
+
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the store-postgres plugin cdylib
+        working-directory: store-postgres
+        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Build busbar-plugin-pack (from the sibling busbar checkout)
+        working-directory: busbarAI
+        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-pack
+        shell: bash
+
+      - name: Package + sign the plugin tarball
+        env:
+          BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          outdir="plugin-dist"; mkdir -p "$outdir"
+          pack="busbarAI/target/${target}/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="busbarAI/target/${target}/release/busbar-plugin-pack.exe"
+          unsigned_flag=""
+          if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."
+            unsigned_flag="--allow-unsigned"
+          fi
+          lib="store-postgres/target/${target}/release/${{ matrix.libprefix }}busbar_store_postgres_plugin.${{ matrix.libext }}"
+          "$pack" pack \
+            --lib "$lib" \
+            --name "busbar-store-postgres" --alias "postgres" --kind store \
+            --version "$ver" --publisher busbar \
+            --description "First-party signed kind:store plugin cdylib: the Postgres backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set governance.store: postgres to share virtual keys, budgets, and usage across a fleet of busbar nodes." \
+            --license Apache-2.0 \
+            --out "${outdir}/busbar-store-postgres-${ver}-${target}.tar.gz" \
+            $unsigned_flag
+          ls -l "$outdir"
+        shell: bash
+
+      - name: Attach plugin tarball to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" plugin-dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
+        shell: bash
+
+      # Keyless (Sigstore/OIDC) build-provenance attestation binding this tarball's digest to this
+      # workflow run + commit — `gh attestation verify <tarball> --repo ${{ github.repository }}`.
+      - name: Attest plugin build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "plugin-dist/*.tar.gz"
