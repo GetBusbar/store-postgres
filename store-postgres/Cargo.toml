@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-store-postgres"
+version = "1.0.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.97"
+description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_api::Store over a mutex-guarded sync postgres client."
+license = "Apache-2.0"
+
+[dependencies]
+# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
+# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
+# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-postgres-plugin.
+busbar-api = { path = "../../busbarAI/crates/api" }
+postgres = "0.19"
+serde_json = "1"

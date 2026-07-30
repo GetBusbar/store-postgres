@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-store-postgres-plugin"
+version = "1.0.0"
+publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
+edition = "2021"
+rust-version = "1.97"
+description = "First-party signed kind:store plugin cdylib: the Postgres backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set governance.store: postgres to share virtual keys, budgets, and usage across a fleet of busbar nodes."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]   # cdylib for the C ABI delivery; all the SQL/logic lives in busbar-store-postgres
+
+[dependencies]
+# busbar-store-postgres is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs —
+# the real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into
+# busbarAI — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet;
+# once it ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
+busbar-api = { path = "../../busbarAI/crates/api" }
+busbar-store-postgres = { path = "../store-postgres" }
+busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
+serde_json = "1"
+
+[dev-dependencies]
+# INTERIM local path deps into busbarAI, same rationale as above — these are dev-only (the end-to-end
+# test loads the built cdylib over the real loader ABI seam, and independently re-verifies persistence
+# via the plain PostgresStore — already a normal dependency above — bypassing the cdylib/ABI entirely),
+# never shipped in the plugin artifact itself.
+busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
+postgres = "0.19"

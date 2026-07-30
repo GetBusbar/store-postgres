@@ -27,11 +27,15 @@ explicitly in production; do not assume they move together.
 It is a `cdylib` that implements busbar's `Store` trait (via
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
-`dlopen`'d, not spawned as a separate process. All the SQL and schema
-logic lives in the `busbar-store-postgres` library crate (which a
-custom build can also link statically instead of loading this cdylib);
-this repo's own `src/lib.rs` only adapts the engine's JSON config
-(`{"url": "postgres://..."}`) into a `PostgresStore`.
+`dlopen`'d, not spawned as a separate process.
+
+This repo is a same-repo, 2-crate Cargo workspace: it brings 100% of
+what it needs. All the SQL and schema logic lives in the
+`busbar-store-postgres` crate (`store-postgres/`, a same-repo sibling
+this plugin wraps — a custom build can also link it statically instead
+of loading this cdylib); `store-postgres-plugin/src/lib.rs` only adapts
+the engine's JSON config (`{"url": "postgres://..."}`) into a
+`PostgresStore`.
 
 ## What it is for
 
@@ -55,9 +59,10 @@ this repo's own `src/lib.rs` only adapts the engine's JSON config
   restart (let your supervisor handle it).
 
 See the doc comments at the top of
-[`busbar-store-postgres`'s `src/lib.rs`](https://github.com/GetBusbar/busbarAI/blob/1.5.0-dev/crates/store-postgres/src/lib.rs)
+[`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
 for the full design rationale — that is where the actual store logic
-lives; this repo is the thin `cdylib` adapter around it.
+lives (in this repo now, not busbarAI); `store-postgres-plugin/` is the
+thin `cdylib` adapter around it.
 
 ## Build
 
@@ -67,53 +72,60 @@ until [busbarAI](https://github.com/GetBusbar/busbarAI) ships publicly
 [Dependencies](#dependencies) below).
 
 ```sh
-cargo build --release      # cdylib: target/release/libbusbar_store_postgres_plugin.{so,dylib}
-cargo test                 # the end-to-end loader tests (see tests/e2e.rs) — need a real Postgres, see below
-cargo clippy --all-targets -- -D warnings
+cargo build --workspace --release   # cdylib: target/release/libbusbar_store_postgres_plugin.{so,dylib}
+cargo test --workspace              # the end-to-end loader tests (see store-postgres-plugin/tests/e2e.rs) — need a real Postgres, see below
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 ## Dependencies
 
-This crate depends on `busbar-api`, `busbar-store-postgres`, and
-`busbar-plugin-sdk` (and, as a dev-dependency for the end-to-end test,
-`busbar-plugin-loader`) from the
+This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
+real logic crate, and `store-postgres-plugin/`, the thin `cdylib`
+adapter — see [members](Cargo.toml)). `busbar-store-postgres` is a
+SAME-REPO sibling dependency; only `busbar-api` and `busbar-plugin-sdk`
+(and, as a dev-dependency of the plugin adapter for the end-to-end
+test, `busbar-plugin-loader`) still reach into the
 [busbarAI](https://github.com/GetBusbar/busbarAI) monorepo. Because
-busbarAI is not yet public, `Cargo.toml` points at these as **local
-path dependencies** (`../busbarAI/crates/...`), which means this repo
-expects to be checked out as a sibling of `busbarAI`:
+busbarAI is not yet public, both crates' `Cargo.toml`s point at those
+as **local path dependencies** (`../../busbarAI/crates/...`), which
+means this repo expects to be checked out as a sibling of `busbarAI`:
 
 ```
 some-parent-dir/
 ├── busbarAI/
 └── store-postgres/
+    ├── Cargo.toml                 # workspace root
+    ├── store-postgres/            # busbar-store-postgres — the real logic crate
+    └── store-postgres-plugin/     # busbar-store-postgres-plugin — the thin dlopen adapter
 ```
 
 This is an interim measure — once busbarAI ships publicly, these
 should become git (pinned rev/tag) or crates.io dependencies instead.
-Grep `Cargo.toml` for the `INTERIM` comments when doing that migration.
+Grep both crates' `Cargo.toml` for the `INTERIM` comments when doing
+that migration.
 
 ## Tests need a real Postgres
 
 Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
-actually persist." `tests/e2e.rs` dlopens the built cdylib over the
-real `busbar-plugin-loader` ABI seam (the same seam the engine uses for
-`governance.store: postgres`), writes a key and a usage ledger through
-it, closes the plugin, and then proves the data genuinely landed in
-Postgres two independent ways: re-opening the same cdylib against the
-same database, and connecting directly with the plain
-`busbar-store-postgres::PostgresStore` — a path that never touches the
-cdylib, the C ABI, or the loader at all.
+actually persist." `store-postgres-plugin/tests/e2e.rs` dlopens the
+built cdylib over the real `busbar-plugin-loader` ABI seam (the same
+seam the engine uses for `governance.store: postgres`), writes a key
+and a usage ledger through it, closes the plugin, and then proves the
+data genuinely landed in Postgres two independent ways: re-opening the
+same cdylib against the same database, and connecting directly with
+the plain `busbar-store-postgres::PostgresStore` — a path that never
+touches the cdylib, the C ABI, or the loader at all.
 
-Both `tests/e2e.rs` here and `busbar-store-postgres`'s own
-`roundtrip_against_live_postgres` test (in the sibling `busbarAI`
-checkout) are gated on the `BUSBAR_TEST_POSTGRES_URL` env var:
+Both `store-postgres-plugin/tests/e2e.rs` and `busbar-store-postgres`'s
+own `roundtrip_against_live_postgres` test (`store-postgres/src/tests.rs`,
+same repo now) are gated on the `BUSBAR_TEST_POSTGRES_URL` env var:
 
 ```sh
 # Point at any reachable Postgres 16+ database:
 export BUSBAR_TEST_POSTGRES_URL=postgres://busbar:busbar@localhost:5432/busbar_test
-cargo test
+cargo test --workspace
 ```
 
 Locally, with the env var unset, both test suites print a `skip:`

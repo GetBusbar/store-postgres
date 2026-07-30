@@ -16,4 +16,11 @@ jobs:
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
-      extra_sibling_test_command: cargo test -p busbar-store-postgres
+      # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
+      # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
+      # exercise the monorepo's own copy of the store logic against the sibling busbarAI checkout's
+      # `crates/store-postgres` package; that package no longer exists in busbarAI (the real logic
+      # crate now lives HERE, in this repo's own `store-postgres/` member) — the plugin's own
+      # `cargo test` step above (working-directory: plugin, a workspace covering both
+      # `busbar-store-postgres` and `busbar-store-postgres-plugin`) already exercises it in full,
+      # so the sibling-checkout step would now fail (no such package) and is redundant besides.
