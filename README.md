@@ -11,7 +11,8 @@ The first-party, signed `kind: store` plugin for
 [busbar](https://getbusbar.com): the Postgres backend for busbar's
 durable governance store, exported over the store C ABI. Drop the built
 `.so`/`.dylib`/`.dll` into the engine's plugins folder and set
-`governance.store: postgres`; the engine loads it in-process at boot.
+`store: { module: postgres, settings: { url: "postgres://..." } }`; the
+engine loads it in-process at boot.
 One Postgres behind a fleet of busbar nodes means virtual keys,
 budgets, and usage are shared across the cluster instead of siloed per
 node.
@@ -25,7 +26,7 @@ signed hybrid plugin ABI this crate loads over). Pin both versions
 explicitly in production; do not assume they move together.
 
 It is a `cdylib` that implements busbar's `Store` trait (via
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
+[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
 `dlopen`'d, not spawned as a separate process.
 
@@ -67,7 +68,7 @@ thin `cdylib` adapter around it.
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbarAI) ships publicly
+until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly
 — a sibling checkout of `busbarAI` at `../busbarAI` (see
 [Dependencies](#dependencies) below).
 
@@ -86,7 +87,7 @@ adapter — see [members](Cargo.toml)). `busbar-store-postgres` is a
 SAME-REPO sibling dependency; only `busbar-api` and `busbar-plugin-sdk`
 (and, as a dev-dependency of the plugin adapter for the end-to-end
 test, `busbar-plugin-loader`) still reach into the
-[busbarAI](https://github.com/GetBusbar/busbarAI) monorepo. Because
+[busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
 busbarAI is not yet public, both crates' `Cargo.toml`s point at those
 as **local path dependencies** (`../../busbarAI/crates/...`), which
 means this repo expects to be checked out as a sibling of `busbarAI`:
@@ -111,7 +112,7 @@ Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
 actually persist." `store-postgres-plugin/tests/e2e.rs` dlopens the
 built cdylib over the real `busbar-plugin-loader` ABI seam (the same
-seam the engine uses for `governance.store: postgres`), writes a key
+seam the engine uses for `store: { module: postgres }`), writes a key
 and a usage ledger through it, closes the plugin, and then proves the
 data genuinely landed in Postgres two independent ways: re-opening the
 same cdylib against the same database, and connecting directly with
@@ -139,7 +140,7 @@ every push, specifically so this coverage can never quietly vanish.
 
 Once built, the cdylib is packed and signed like any other busbar
 plugin — see
-[`docs/plugins.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/plugins.md#signing-and-packaging)
+[`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
 in busbarAI for the full reference. In short:
 
 ```sh
@@ -156,9 +157,16 @@ For local development without a signing key, `busbar-plugin-pack pack
 `plugins.trust.allow_unsigned: true`.
 
 Drop the resulting tarball into busbar's configured `plugins.dir` and
-reference it as the governance store — see
-[`docs/configuration.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/configuration.md)
-in busbarAI for the `governance.store:` wiring.
+set:
+
+```yaml
+store:
+  module: postgres
+  settings: { url: "postgres://user:pass@host/busbar" }
+```
+
+— see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
+for the full store config reference.
 
 ## Config
 
