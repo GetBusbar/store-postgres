@@ -5,7 +5,7 @@ version = "1.0.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "First-party signed kind:store plugin cdylib: the Postgres backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set governance.store: postgres to share virtual keys, budgets, and usage across a fleet of busbar nodes."
+description = "First-party signed kind:store plugin cdylib: the Postgres backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set store.module: postgres to share virtual keys, budgets, and usage across a fleet of busbar nodes."
 license = "Apache-2.0"
 
 [lib]

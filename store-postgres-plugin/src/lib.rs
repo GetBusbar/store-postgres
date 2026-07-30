@@ -3,8 +3,9 @@
 
 //! The **Postgres store as a droppable busbar plugin** — a `cdylib` exporting the store C ABI.
 //! Build it, drop the resulting `.so`/`.dll`/`.dylib` into the engine's plugins folder, and set
-//! `governance.store: postgres`; the engine loads it in-process at boot. One Postgres behind a fleet
-//! of busbar nodes means shared virtual keys, budgets, and usage across the cluster.
+//! `store: { module: postgres, settings: { url: "postgres://..." } }`; the engine loads it
+//! in-process at boot. One Postgres behind a fleet of busbar nodes means shared virtual keys,
+//! budgets, and usage across the cluster.
 //!
 //! All the SQL lives in the `busbar-store-postgres` `lib` crate (which a custom build can also link
 //! statically). Here we only adapt the engine's JSON config into a `PostgresStore`.
