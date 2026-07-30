@@ -172,7 +172,7 @@ for the full store config reference.
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. |
+| `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. **No connect timeout is set by default** — a blackholed host wedges engine boot indefinitely. libpq honors a `connect_timeout` query param in the DSN, e.g. `postgres://user:pass@host:5432/busbar?connect_timeout=10`; set one if boot hanging on a dead host is a concern. |
 
 ## License
 

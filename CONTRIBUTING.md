@@ -14,7 +14,7 @@ how to build, test, and submit changes.
 ## Development setup
 
 `store-postgres` is a Rust `cdylib` plugin. You need a recent stable toolchain
-(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbarAI)
+(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
 ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
 README's [Dependencies](README.md#dependencies) section for the exact layout;
@@ -48,7 +48,7 @@ cargo fmt --all -- --check                   # format before committing
 
 This repo is deliberately a thin adapter (`src/lib.rs`): it turns the engine's
 JSON `open` config into a `PostgresStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk),
+[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
 which emits the C ABI symbols the loader resolves. All the SQL and schema logic
 lives in the `busbar-store-postgres` library crate this plugin wraps, in the
 `busbarAI` monorepo — most substantive changes belong there, not here.

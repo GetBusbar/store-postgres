@@ -214,8 +214,8 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     .err()
     .expect("an unreachable postgres target must fail to load");
     assert!(
-        !err.is_empty(),
-        "expected a descriptive connect failure, got an empty string"
+        err.contains("error connecting to server"),
+        "expected tokio-postgres's own connect-failure message to survive the ABI crossing, got: {err}"
     );
 }
 
