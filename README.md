@@ -1,6 +1,13 @@
 # store-postgres
 
-**v1.5.0.** The first-party, signed `kind: store` plugin for
+**This plugin's version: v1.0.0.** (Independently versioned from busbar
+itself — see [Versioning](#versioning) below.)
+
+[![CI](https://github.com/GetBusbar/store-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-postgres/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/GetBusbar/store-postgres)](https://github.com/GetBusbar/store-postgres/releases)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+The first-party, signed `kind: store` plugin for
 [busbar](https://getbusbar.com): the Postgres backend for busbar's
 durable governance store, exported over the store C ABI. Drop the built
 `.so`/`.dylib`/`.dll` into the engine's plugins folder and set
@@ -8,6 +15,14 @@ durable governance store, exported over the store C ABI. Drop the built
 One Postgres behind a fleet of busbar nodes means virtual keys,
 budgets, and usage are shared across the cluster instead of siloed per
 node.
+
+## Versioning
+
+This plugin is versioned **independently of busbar** — `v1.0.0` here says
+nothing about which busbar release it is. Compatibility with busbar is
+stated separately: **requires busbar 1.5.0+** (the release that ships the
+signed hybrid plugin ABI this crate loads over). Pin both versions
+explicitly in production; do not assume they move together.
 
 It is a `cdylib` that implements busbar's `Store` trait (via
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
@@ -119,9 +134,9 @@ in busbarAI for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_postgres_plugin.so \
     --name busbar-store-postgres-plugin --alias postgres --kind store \
-    --version 1.5.0 --publisher busbar \
+    --version 1.0.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-postgres-plugin-1.5.0-x86_64-linux.tar.gz
+    --out busbar-store-postgres-plugin-1.0.0-x86_64-linux.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack
@@ -138,3 +153,10 @@ in busbarAI for the `governance.store:` wiring.
 | Setting | Required | Default | Notes |
 |---|---|---|---|
 | `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. |
+
+## License
+
+Licensed **Apache-2.0** ([LICENSE](LICENSE)). Contributions welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md); security issues go through
+[SECURITY.md](SECURITY.md), not public issues.

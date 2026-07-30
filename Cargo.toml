@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "busbar-store-postgres-plugin"
-version = "1.5.0"
+version = "1.0.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
 rust-version = "1.97"

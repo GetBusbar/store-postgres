@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "busbar-store-postgres-plugin"
-version = "1.5.0"
+version = "1.0.0"
 dependencies = [
  "busbar-api",
  "busbar-plugin-loader",
