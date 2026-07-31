@@ -175,17 +175,28 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 
     let config = work.join("config.yaml");
     let providers = work.join("providers.yaml");
+    // providers.yaml is the flat CATALOG (provider name at the document root, no wrapping key) --
+    // config.yaml separately has its OWN `providers:`/`models:` blocks naming which catalog
+    // entries are enabled. Mirrors the known-good fixture in
+    // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
+    std::fs::write(
+        &providers,
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+    )
+    .unwrap();
     std::fs::write(
         &config,
         format!(
-            "store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
-             plugins:\n  enabled: true\n  dir: {}\n\
-             auth:\n  chain: []\n",
+            "listen: \"127.0.0.1:0\"\n\
+             store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
+             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+             auth:\n  chain: []\n\
+             providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+             models:\n  test-model:\n    provider: mock\n",
             plugins_dir.display()
         ),
     )
     .unwrap();
-    std::fs::write(&providers, "").unwrap();
 
     let out = Command::new(&busbar_bin)
         .arg("--validate")
