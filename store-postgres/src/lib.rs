@@ -258,6 +258,24 @@ impl PostgresStore {
         self.client.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Open a transaction that gives every statement inside it ONE consistent snapshot, taken at the
+    /// transaction's first statement. Plain `client.transaction()` defaults to READ COMMITTED, which
+    /// does NOT give this: each statement gets its OWN fresh snapshot as of that statement's start, so
+    /// a concurrent commit landing between two SELECTs in the same READ-COMMITTED transaction is
+    /// visible to the second but invisible to the first — a torn read. `get_usage` (its only current
+    /// caller: a requests-row SELECT followed by a model-rows SELECT, both needing to describe the
+    /// SAME point in time) depends on this. `pub(crate)` so `tests.rs` can prove the isolation level
+    /// this function actually opens, rather than a hand-rolled duplicate of the transaction-open call.
+    pub(crate) fn snapshot_consistent_tx<'a>(
+        client: &'a mut Client,
+    ) -> StoreResult<postgres::Transaction<'a>> {
+        client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .store()
+    }
+
     /// A fixed, arbitrary-but-stable `pg_advisory_lock` key scoping every `migrate()` call across
     /// every process/connection that ever opens this crate's schema. See `migrate()`'s doc comment
     /// for why this exists.
@@ -435,6 +453,14 @@ impl Store for PostgresStore {
             .store()?;
         tx.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id])
             .store()?;
+        // The raw per-(key_id,bucket,model,provider) billing ledger also keys on this id and must not
+        // survive a hard delete: an orphaned row here silently corrupts cost reconstruction if the id
+        // is ever reused. (Operators who want to retire a key while KEEPING its billing/audit history
+        // have two non-destructive paths that never reach this method: PATCH /keys/{id} enabled:false,
+        // or POST /keys/{id}/revoke — both documented in admin-api.md as preserving history. DELETE is
+        // the deliberate hard-purge primitive, so it must purge everything, this table included.)
+        tx.execute("DELETE FROM usage_metering WHERE key_id=$1", &[&id])
+            .store()?;
         tx.execute("DELETE FROM aws_credentials WHERE key_id=$1", &[&id])
             .store()?;
         tx.commit().store()?;
@@ -442,11 +468,9 @@ impl Store for PostgresStore {
     }
 
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
-        // Read the requests row + every model row inside ONE transaction so a concurrent node's
-        // `add_usage` can never yield a torn ledger.
         let ws = clamp(window_start);
         let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
         let (requests, billable_requests): (u64, u64) = tx
             .query_opt(
                 "SELECT requests, billable_requests

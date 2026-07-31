@@ -349,6 +349,15 @@ fn roundtrip_against_live_postgres() {
             .any(|c| c.access_key_id == "AKIA_PG_TEST"),
         "delete_key must cascade to the AWS credentials (credential cleanup, P1 #6)"
     );
+    assert!(
+        !store
+            .list_metering(m_bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == "vk_pg"),
+        "delete_key must cascade to usage_metering (the raw billing ledger) too, or a reused id \
+         inherits the old key's stale token/request counts"
+    );
 }
 
 /// H1 (data-loss regression): migrate() must NEVER conflate a transient version-read error with
@@ -428,4 +437,91 @@ fn migrate_version_read_error_is_not_treated_as_fresh_db() {
         "a healthy current-version DB must NOT be dropped by a migrate() re-run"
     );
     store2.delete_key("vk_h1").unwrap();
+}
+
+/// Isolated, minimal repro: delete_key must remove usage_metering rows for the deleted key.
+#[test]
+fn delete_key_cascades_to_usage_metering_isolated() {
+    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("BUSBAR_TEST_POSTGRES_URL is unset under CI");
+            }
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+    let store = PostgresStore::connect(&url).expect("connect+migrate");
+    let _ = store.delete_key("vk_iso_test");
+    let key = VirtualKey {
+        id: "vk_iso_test".into(),
+        key_hash: "h_iso".into(),
+        name: "iso".into(),
+        allowed_pools: None,
+        enabled: true,
+        created_at: 1,
+        group: None,
+        labels: std::collections::BTreeMap::new(),
+    };
+    store.put_key(&key).unwrap();
+    let bucket = 99_999_888_u64;
+    store
+        .add_metering(&MeteringDelta {
+            key_id: "vk_iso_test".into(),
+            bucket,
+            model: "m".into(),
+            provider: "p".into(),
+            tokens_input: 1,
+            tokens_output: 1,
+            tokens_cache_read: 0,
+            tokens_cache_creation: 0,
+            requests: 1,
+        })
+        .unwrap();
+    let before = store.list_metering(bucket).unwrap();
+    assert!(
+        before.iter().any(|r| r.key_id == "vk_iso_test"),
+        "metering row must exist before delete"
+    );
+    store.delete_key("vk_iso_test").unwrap();
+    let after = store.list_metering(bucket).unwrap();
+    assert!(
+        !after.iter().any(|r| r.key_id == "vk_iso_test"),
+        "delete_key must remove usage_metering rows too, got: {after:?}"
+    );
+}
+
+/// `get_usage`'s two SELECTs need one consistent snapshot so a concurrent add_usage can never
+/// produce a torn read (READ COMMITTED gives each statement its OWN fresh snapshot; REPEATABLE READ
+/// takes one snapshot at the transaction's first statement and holds it). Proves the ACTUAL
+/// transaction-open helper `get_usage` calls (`PostgresStore::snapshot_consistent_tx`, not a
+/// hand-rolled duplicate) really opens at REPEATABLE READ, by asking Postgres itself.
+///
+/// RED (pre-fix, plain `client.transaction()`): reports "read committed".
+/// GREEN: reports "repeatable read".
+#[test]
+fn get_usage_transaction_is_actually_repeatable_read() {
+    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("BUSBAR_TEST_POSTGRES_URL is unset under CI");
+            }
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+    let store = PostgresStore::connect(&url).expect("connect+migrate");
+    let mut client = store.lock();
+    let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).expect("open tx");
+    let level: String = tx
+        .query_one("SHOW transaction_isolation", &[])
+        .unwrap()
+        .get(0);
+    tx.rollback().unwrap();
+    assert_eq!(
+        level, "repeatable read",
+        "get_usage's transaction-open helper must actually open at REPEATABLE READ, got: {level}"
+    );
 }
