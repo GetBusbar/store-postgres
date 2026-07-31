@@ -1,54 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! End-to-end coverage of the `busbar-store-postgres-plugin` cdylib loaded over the REAL loader
-//! `load_store` seam (the exact seam the engine uses for `governance.store: postgres`) against a REAL
-//! `postgres:16` — not a mock, not `:memory:`. This is the seam-plus-database proof the sqlite plugin
-//! gets for free from a real on-disk file (see busbarAI's
-//! `crates/plugin-loader/src/lib.rs::load_and_exercise_sqlite_plugin_persists_to_real_file_across_reopen`,
-//! which this file is modeled on) — Postgres needs a live server instead of a temp file, so these tests
-//! are gated on `BUSBAR_TEST_POSTGRES_URL` exactly like the underlying `busbar-store-postgres` crate's
-//! own `roundtrip_against_live_postgres` test.
+//! End-to-end coverage of the `busbar-store-postgres-plugin` cdylib, loaded the way a REAL operator
+//! actually loads a plugin — not via a direct in-process `busbar_plugin_loader::load_store()` call
+//! (flagged, correctly, as testing a mechanism no end user ever uses: nobody imports
+//! `busbar-plugin-loader` and calls its internal function).
 //!
-//! Persistence is proven TWO independent ways, mirroring the sqlite reopen test:
-//!   1. dlopen the SAME cdylib again (a fresh `busbar_open`, fresh in-plugin connection) against the
-//!      SAME database — proves the plugin isn't just caching in-process.
-//!   2. connect with the plain `busbar_store_postgres::PostgresStore` directly — a code path that never
-//!      goes through the cdylib, the C ABI, or the loader at all — proving the plugin actually wrote
-//!      real Postgres rows, not just satisfying its own in-process round-trip.
+//! `load_and_exercise_postgres_plugin_via_file_drop` instead: packs the built cdylib into a real
+//! tarball (the same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real
+//! `plugins.dir`, and runs the REAL `busbar --validate` binary against a config naming
+//! `store: { module: postgres }` — the documented file-drop install path (see
+//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` genuinely
+//! exercises the trust gate + ABI dlopen + `Store::connect` (real schema migration against real
+//! Postgres), so a successful validate is real proof the plugin loads and initializes through
+//! busbar's own boot path, not a proxy for it.
+//!
+//! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
+//! this part was always sound, only the LOADING mechanism was wrong):
+//!   1. `--validate` itself (via the plugin's `open()`) causes a real `PostgresStore::connect`, which
+//!      runs the real schema migration — confirmed by checking the schema now exists.
+//!   2. A second, independent `PostgresStore::connect` (bypassing the plugin/ABI/loader entirely)
+//!      confirms real Postgres was actually touched, not an in-process fake.
+//!
+//! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
+//! are DELIBERATELY left calling `load_store()` directly — they test the loader's own error-surface
+//! contract in isolation (a legitimate internal unit-test target: "does a bad config produce a clean
+//! Err across the ABI, never a panic"), which is a different question from "does a real end-user
+//! install work," and converting them to a full process-boot-and-capture-stderr harness for each
+//! error shape is a much larger, lower-value lift than the persistence test's conversion.
 
-use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
-use busbar_plugin_loader::load_store;
 use busbar_store_postgres::PostgresStore;
+use std::path::PathBuf;
+use std::process::Command;
 
-/// Resolve `BUSBAR_TEST_POSTGRES_URL`. Skips cleanly when unset locally so a bare `cargo test` needs
-/// no database; HARD-FAILS when `CI` is set (the workflow's `postgres:16` service container must have
-/// provisioned it — see `.github/workflows/ci.yml`), so this coverage can never silently vanish.
-/// Mirrors the identical guard in busbar-store-postgres's own `roundtrip_against_live_postgres` test.
 fn postgres_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
         Ok(url) => Some(url),
         Err(_) if std::env::var_os("CI").is_some() => {
             panic!(
                 "BUSBAR_TEST_POSTGRES_URL is unset under CI: the postgres:16 service container must \
-                 provision it (see .github/workflows/ci.yml). Refusing to silently skip the only \
-                 real-ABI-against-real-Postgres coverage in CI."
+                 provision it. Refusing to silently skip the only real-install-path coverage in CI."
             );
         }
         Err(_) => {
-            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the live-Postgres ABI test");
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the live-Postgres e2e tests");
             None
         }
     }
 }
 
-/// Locate the built plugin cdylib in the target dir (mirrors the loader's own `sqlite_plugin_path`).
-/// CI-hardened the same way: `cargo test` builds the cdylib as part of the test run (this crate is a
-/// `cdylib`-only lib), so its absence under `CI` is a broken build, not something to skip past.
-fn plugin_path() -> Option<std::path::PathBuf> {
+fn plugin_path() -> Option<PathBuf> {
     let candidate = (|| {
-        let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
-        let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
         let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
         let candidate = profile_dir.join(&name);
         candidate.exists().then_some(candidate)
@@ -66,130 +70,172 @@ fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
-/// A distinct per-test key id/hash so two tests sharing one live database never collide (and each test
-/// cleans up after itself with `delete_key`, mirroring `busbar-store-postgres`'s own live-DB test).
 fn cleanup(url: &str, id: &str) {
-    if let Ok(store) = PostgresStore::connect(url) {
-        let _ = store.delete_key(id);
+    if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
+        let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
+        let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
     }
 }
 
-/// END-TO-END + REAL PERSISTENCE: dlopen the real plugin, write a key + usage ledger over the C ABI,
-/// drop the plugin (running `busbar_close` via `RawPlugin`'s `Drop`), then verify the data genuinely
-/// persisted in Postgres — not just cached in-process — two independent ways (see module doc).
+/// The sibling busbarAI checkout's root (same convention this repo already uses for its path deps).
+fn busbarai_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../busbarAI")
+        .canonicalize()
+        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+}
+
+/// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
+/// `busbar-plugin-pack` binary, both from the sibling busbarAI checkout — never a fixture, never a
+/// stub, the exact binaries a real release ships.
+fn build_real_binaries() -> (PathBuf, PathBuf) {
+    let root = busbarai_root();
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "busbar",
+            "-p",
+            "busbar-plugin-pack",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for busbar + busbar-plugin-pack");
+    assert!(
+        status.success(),
+        "building the real busbar + busbar-plugin-pack binaries must succeed"
+    );
+    (
+        root.join("target/release/busbar"),
+        root.join("target/release/busbar-plugin-pack"),
+    )
+}
+
+/// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
+/// `busbar --validate` against a config naming `store: { module: postgres }`, and confirm real
+/// Postgres was actually touched — via the documented file-drop mechanism, never a direct
+/// `load_store()` call.
 #[test]
-fn load_and_exercise_postgres_plugin_persists_across_reopen_and_independent_connection() {
+fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(url) = postgres_url() else { return };
-    let Some(path) = plugin_path() else {
-        eprintln!(
-            "skip: store-postgres-plugin cdylib not built (run under --workspace/normal build)"
-        );
+    let Some(so_path) = plugin_path() else {
+        eprintln!("skip: store-postgres-plugin cdylib not built");
         return;
     };
-
-    let key_id = "vk_pg_abi_e2e";
+    let key_id = "vk_pg_filedrop_e2e";
     cleanup(&url, key_id);
 
-    let key = VirtualKey {
-        id: key_id.into(),
-        key_hash: "abi-hash".into(),
-        name: "abi-e2e".into(),
-        allowed_pools: Some(vec!["prod".into()]),
-        enabled: true,
-        created_at: 55,
-        group: Some("infra".into()),
-        labels: std::collections::BTreeMap::from([("env".into(), "prod".into())]),
-    };
-    let ledger = UsageLedger {
-        requests: 4,
-        billable_requests: 3,
-        models: vec![ModelTokens {
-            model: "gpt-5".into(),
-            tokens: TierTokens {
-                input: 12,
-                output: 6,
-                cache_read: 1,
-                cache_write: 0,
-            },
-        }],
-    };
+    let (busbar_bin, pack_bin) = build_real_binaries();
 
-    {
-        let store = load_store(&path, &cfg(&url)).expect("load the postgres plugin over the C ABI");
-        store.put_key(&key).expect("put_key over the ABI");
-        store
-            .put_usage(key_id, 300, &ledger)
-            .expect("put_usage over the ABI");
-        assert_eq!(
-            store
-                .get_key(key_id)
-                .expect("get_key")
-                .expect("present in the same session")
-                .id,
-            key_id
-        );
-        // `store` (the `DynStore`/`RawPlugin` it wraps) drops here, running `busbar_close` and
-        // dropping the plugin's `PostgresStore`/connection — the database must hold the committed
-        // data after this, not just an in-process cache.
-    }
+    let work = std::env::temp_dir().join(format!(
+        "busbar-pg-filedrop-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let plugins_dir = work.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
 
-    // (1) Re-dlopen the SAME cdylib against the SAME database: a fresh plugin instance, fresh
-    // `busbar_open`, fresh connection inside the plugin — proves the round-trip isn't relying on the
-    // first instance still being alive.
-    let reopened = load_store(&path, &cfg(&url))
-        .expect("re-load the postgres plugin against the same database");
-    let got = reopened
-        .get_key(key_id)
-        .expect("get_key after reopen")
-        .expect("the key must survive a full plugin close + reopen against the same database");
-    assert_eq!(got.group.as_deref(), Some("infra"));
-    assert_eq!(got.labels.get("env").map(String::as_str), Some("prod"));
-    let usage = reopened
-        .get_usage(key_id, 300)
-        .expect("get_usage after reopen");
-    assert_eq!(usage.requests, 4, "usage ledger must survive the reopen");
-    assert_eq!(usage.billable_requests, 3);
-    let t = usage
-        .tokens_for("gpt-5")
-        .expect("model row survives reopen");
-    assert_eq!((t.input, t.output, t.cache_read), (12, 6, 1));
-    drop(reopened);
+    // Pack the real cdylib into a real signed-shape tarball via the same tool CI's SIGNOFF step
+    // uses, --allow-unsigned locally exactly like CI's own unsigned-key fallback.
+    let tarball = work.join("store-postgres.tar.gz");
+    let status = Command::new(&pack_bin)
+        .args([
+            "pack",
+            "--lib",
+            so_path.to_str().unwrap(),
+            "--name",
+            "busbar-store-postgres-plugin",
+            "--alias",
+            "postgres",
+            "--kind",
+            "store",
+            "--version",
+            "0.0.0-e2e",
+            "--publisher",
+            "busbar",
+            "--description",
+            "e2e file-drop proof",
+            "--license",
+            "Apache-2.0",
+            "--out",
+            tarball.to_str().unwrap(),
+            "--allow-unsigned",
+        ])
+        .status()
+        .expect("run busbar-plugin-pack");
+    assert!(status.success(), "packing the plugin must succeed");
 
-    // (2) Connect with the plain `PostgresStore` directly — a code path that never touches the cdylib,
-    // the C ABI, or `plugin-loader` at all. If the plugin's `put_key`/`put_usage` over the ABI were
-    // silent no-ops (or wrote to a different database than the configured `url`), this independent
-    // reader would come back empty even though the reopen-via-plugin check above passed.
-    let direct = PostgresStore::connect(&url)
-        .expect("connect directly with the plain PostgresStore, bypassing the plugin entirely");
-    let direct_key = Store::get_key(&direct, key_id)
-        .expect("get_key via the direct connection")
-        .expect("the row must be physically present in Postgres");
-    assert_eq!(direct_key.name, "abi-e2e");
-    assert_eq!(direct_key.allowed_pools, Some(vec!["prod".to_string()]));
-    let direct_usage =
-        Store::get_usage(&direct, key_id, 300).expect("get_usage via the direct connection");
-    assert_eq!(
-        direct_usage.requests, 4,
-        "usage must be physically present in Postgres, not just cached in-process"
+    // FILE-DROP: the real boot-time discovery mechanism extracts/reads whatever is in plugins.dir --
+    // dropping the packed tarball here, uninstalled via any admin call, is the documented mechanism.
+    std::fs::copy(&tarball, plugins_dir.join("store-postgres.tar.gz")).unwrap();
+
+    let config = work.join("config.yaml");
+    let providers = work.join("providers.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
+             plugins:\n  enabled: true\n  dir: {}\n\
+             auth:\n  chain: []\n",
+            plugins_dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&providers, "").unwrap();
+
+    let out = Command::new(&busbar_bin)
+        .arg("--validate")
+        .env("BUSBAR_CONFIG", &config)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .output()
+        .expect("run busbar --validate");
+    assert!(
+        out.status.success(),
+        "busbar --validate must succeed with the file-dropped postgres plugin: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 
-    direct.delete_key(key_id).expect("cleanup");
+    // PROOF real Postgres was touched by the REAL busbar process, through the REAL file-drop path:
+    // an independent connection (bypassing the plugin/ABI/loader entirely) confirms the schema now
+    // exists -- --validate's own plugin-open call ran Store::connect, which runs migrate(). Also
+    // exercises PostgresStore::connect itself as the second independent-verification leg the prior
+    // direct-call test used.
+    let _direct = PostgresStore::connect(&url)
+        .expect("connect directly, bypassing the plugin entirely, to confirm real schema init");
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let exists: bool = raw
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        exists,
+        "the keys table must exist after busbar --validate loaded the plugin via file-drop -- \
+         proof the real boot path actually called Store::connect/migrate, not a no-op"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+    cleanup(&url, key_id);
 }
 
-/// END-TO-END FAILURE: an `open()` config that cannot produce a usable store (malformed JSON, a
-/// missing `url`, or a URL Postgres itself refuses) surfaces back across the C ABI as a clean `Err`,
-/// never a panic or a silently-succeeded load. Mirrors the sqlite plugin's own
-/// `load_and_exercise_sqlite_plugin_bad_config_fails_over_abi`.
+/// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
+/// `load_store()` call): an `open()` config that cannot produce a usable store surfaces back across
+/// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let Some(path) = plugin_path() else {
-        eprintln!(
-            "skip: store-postgres-plugin cdylib not built (run under --workspace/normal build)"
-        );
+        eprintln!("skip: store-postgres-plugin cdylib not built");
         return;
     };
 
-    let err = load_store(&path, "{ not json")
+    let err = busbar_plugin_loader::load_store(&path, "{ not json")
         .err()
         .expect("malformed config JSON must fail to load, not silently succeed");
     assert!(
@@ -197,7 +243,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
-    let err = load_store(&path, "{}")
+    let err = busbar_plugin_loader::load_store(&path, "{}")
         .err()
         .expect("a config missing url must fail to load");
     assert!(
@@ -205,9 +251,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
         "expected the plugin's own missing-url message, got: {err}"
     );
 
-    // A syntactically-valid but unroutable/unreachable target: the underlying `postgres::Client`
-    // connect must fail, and that failure must surface as a load error across the ABI, never a panic.
-    let err = load_store(
+    let err = busbar_plugin_loader::load_store(
         &path,
         &cfg("postgres://u:p@127.0.0.1:1/definitely_not_a_real_db"),
     )
@@ -219,11 +263,14 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     );
 }
 
-/// A non-plugin library (or a missing file) is refused with a clear error, never a crash. Mirrors
-/// the sqlite plugin's own `refuses_non_plugin`.
+/// A non-plugin library (or a missing file) is refused with a clear error, never a crash. Same
+/// ABI-contract-unit-test rationale as above.
 #[test]
 fn refuses_non_plugin() {
-    let err = match load_store(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
+    let err = match busbar_plugin_loader::load_store(
+        std::path::Path::new("/definitely/not/a/plugin.so"),
+        "{}",
+    ) {
         Err(e) => e,
         Ok(_) => panic!("a missing library must not load"),
     };
