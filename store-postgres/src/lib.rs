@@ -36,7 +36,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
@@ -374,14 +375,25 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
-    pools
-        .as_ref()
-        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
+// Wire/DB storage format is unchanged by the ScopeRef generalization -- still a plain JSON array
+// of bare pool-name strings (or NULL) in the `allowed_pools` TEXT column. Only the Rust-side type
+// at this crate's boundary changed (`Vec<String>` -> `Vec<ScopeRef>`); the conversion happens here,
+// at construction (`ScopeRef::pool(name)`) and at read (`.value`).
+fn pools_to_storage(pools: &Option<Vec<ScopeRef>>) -> Option<String> {
+    pools.as_ref().map(|p| {
+        let names: Vec<&str> = p.iter().map(|s| s.value.as_str()).collect();
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+    })
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
     let stored = stored?;
-    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
+    Some(
+        serde_json::from_str::<Vec<String>>(stored.trim())
+            .unwrap_or_default()
+            .into_iter()
+            .map(ScopeRef::pool)
+            .collect(),
+    )
 }
 
 fn row_to_key(r: &Row) -> VirtualKey {
@@ -389,7 +401,7 @@ fn row_to_key(r: &Row) -> VirtualKey {
         id: r.get(0),
         generation_hash: r.get(1),
         name: r.get(2),
-        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)),
+        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)),
         enabled: r.get(4),
         created_at: read_u64(r.get::<_, i64>(5)),
         group: r.get(6),
@@ -438,7 +450,7 @@ fn row_to_cred_meta(r: &Row) -> CredentialMeta {
 
 impl Store for PostgresStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let pools = pools_to_storage(&key.allowed_pools);
+        let pools = pools_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
@@ -818,7 +830,7 @@ impl Store for PostgresStore {
         secret: &CredentialSecret,
     ) -> StoreResult<()> {
         // ATOMIC mint: the bearer key and its credential commit together or not at all.
-        let pools = pools_to_storage(&key.allowed_pools);
+        let pools = pools_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
