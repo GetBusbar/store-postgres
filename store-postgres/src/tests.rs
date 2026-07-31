@@ -73,7 +73,7 @@ fn sample_key(id: &str) -> VirtualKey {
         id: id.into(),
         generation_hash: "binding:x:g1".into(),
         name: "k".into(),
-        allowed_pools: None,
+        allowed_scopes: None,
         enabled: true,
         created_at: 100,
         group: None,
@@ -115,25 +115,25 @@ fn key_roundtrip_new_fields() {
 
     let mut k = sample_key("vk_rt1");
     k.expires_at = Some(999);
-    k.allowed_pools = Some(vec![]); // explicit empty grant, must NOT read back as None
+    k.allowed_scopes = Some(vec![]); // explicit empty grant, must NOT read back as None
     store.put_key(&k).unwrap();
     let back = store.get_key("vk_rt1").unwrap().unwrap();
     assert_eq!(back.generation_hash, "binding:x:g1");
     assert_eq!(back.expires_at, Some(999));
     assert_eq!(back.deleted_at, None);
     assert_eq!(
-        back.allowed_pools,
+        back.allowed_scopes,
         Some(vec![]),
         "explicit empty grant must round-trip as Some([]), not None"
     );
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 
     let mut k2 = sample_key("vk_rt2");
-    k2.allowed_pools = None; // omitted grant = all pools
+    k2.allowed_scopes = None; // omitted grant = all pools
     store.put_key(&k2).unwrap();
     let back2 = store.get_key("vk_rt2").unwrap().unwrap();
     assert_eq!(
-        back2.allowed_pools, None,
+        back2.allowed_scopes, None,
         "omitted grant must round-trip as None, not Some([])"
     );
 }

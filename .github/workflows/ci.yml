@@ -10,12 +10,13 @@ on:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@1.5.0-dev
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
     with:
       plugin_crate: busbar-store-postgres-plugin
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
+      busbar_ref: dev
       # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
       # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
       # exercise the monorepo's own copy of the store logic against the sibling busbarAI checkout's
