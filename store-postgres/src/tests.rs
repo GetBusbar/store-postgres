@@ -525,3 +525,123 @@ fn get_usage_transaction_is_actually_repeatable_read() {
         "get_usage's transaction-open helper must actually open at REPEATABLE READ, got: {level}"
     );
 }
+
+/// `list_metering(bucket)` filters on `bucket` alone -- NOT the leading column of
+/// `usage_metering`'s primary key `(key_id, bucket, model, provider)` -- so without a dedicated
+/// index Postgres cannot seek and must scan. Proves the index exists and is actually usable for
+/// this exact query shape (checked via the query planner, not just presence in `pg_indexes`).
+#[test]
+fn usage_metering_bucket_index_exists_and_is_used() {
+    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("BUSBAR_TEST_POSTGRES_URL is unset under CI");
+            }
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+    let store = PostgresStore::connect(&url).expect("connect+migrate");
+    let exists: bool = store
+        .lock()
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='usage_metering' \
+             AND indexname='idx_usage_metering_bucket')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(exists, "idx_usage_metering_bucket must exist");
+
+    let plan: Vec<String> = store
+        .lock()
+        .query(
+            "EXPLAIN SELECT * FROM usage_metering WHERE bucket = 12345",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    let plan_text = plan.join("\n");
+    assert!(
+        plan_text.contains("idx_usage_metering_bucket"),
+        "the planner must actually choose the bucket index for this query shape, got plan:\n{plan_text}"
+    );
+}
+
+/// `put_usage`'s per-model loop now issues ONE multi-row INSERT instead of one round trip per
+/// model. Proves the batched write is functionally identical to N separate inserts for 3+ models
+/// (multiple distinct models land correctly, values are not swapped/misaligned across rows).
+#[test]
+fn put_usage_batched_insert_handles_multiple_models_correctly() {
+    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("BUSBAR_TEST_POSTGRES_URL is unset under CI");
+            }
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL");
+            return;
+        }
+    };
+    let store = PostgresStore::connect(&url).expect("connect+migrate");
+    let bucket = "vk_batch_insert_test";
+    let ws = 777_777_u64;
+    let ledger = UsageLedger {
+        requests: 3,
+        billable_requests: 3,
+        models: vec![
+            ModelTokens {
+                model: "model-a".into(),
+                tokens: TierTokens {
+                    input: 1,
+                    output: 2,
+                    cache_read: 3,
+                    cache_write: 4,
+                },
+            },
+            ModelTokens {
+                model: "model-b".into(),
+                tokens: TierTokens {
+                    input: 10,
+                    output: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                },
+            },
+            ModelTokens {
+                model: "model-c".into(),
+                tokens: TierTokens {
+                    input: 100,
+                    output: 200,
+                    cache_read: 300,
+                    cache_write: 400,
+                },
+            },
+        ],
+    };
+    store.put_usage(bucket, ws, &ledger).unwrap();
+    let got = store.get_usage(bucket, ws).unwrap();
+    assert_eq!(got.models.len(), 3);
+    for m in &ledger.models {
+        let t = got.tokens_for(&m.model).unwrap_or_else(|| {
+            panic!(
+                "model {} missing from batched-insert result: {got:?}",
+                m.model
+            )
+        });
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (
+                m.tokens.input,
+                m.tokens.output,
+                m.tokens.cache_read,
+                m.tokens.cache_write
+            ),
+            "model {} got the wrong row's values -- rows misaligned in the batched insert",
+            m.model
+        );
+    }
+}

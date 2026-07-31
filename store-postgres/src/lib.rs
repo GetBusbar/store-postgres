@@ -192,6 +192,10 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     requests              BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (key_id, bucket, model, provider)
 );
+-- list_metering(bucket) filters on `bucket` alone, which is NOT the leading column of the primary
+-- key above (key_id is) -- without this index, that query cannot seek and must scan the whole
+-- table/index, degrading as the never-pruned billing-critical table grows across a fleet's lifetime.
+CREATE INDEX IF NOT EXISTS idx_usage_metering_bucket ON usage_metering (bucket);
 -- The admin AUDIT log's durable home (mirrors the SQLite backend). Append-only; `seq` is the engine's
 -- monotonic sequence (PK). The engine owns the hash chain; the store persists each record verbatim
 -- (upsert on `seq` so a replay is idempotent) and returns them oldest-first for boot restore.
@@ -534,21 +538,52 @@ impl Store for PostgresStore {
             &[&bucket_id, &ws, &rq, &brq],
         )
         .store()?;
-        for m in &ledger.models {
-            let (ti, to, tcr, tcw) = (
-                clamp(m.tokens.input),
-                clamp(m.tokens.output),
-                clamp(m.tokens.cache_read),
-                clamp(m.tokens.cache_write),
+        if !ledger.models.is_empty() {
+            // ONE multi-row INSERT instead of one round trip per model: each round trip serializes
+            // behind this crate's single mutex-guarded connection, so a ledger with many models
+            // (routing across a large model catalog) turned one logical flush into N sequential
+            // network round trips, extending how long every OTHER store operation on this instance
+            // queued behind the lock.
+            let rows: Vec<(i64, i64, i64, i64)> = ledger
+                .models
+                .iter()
+                .map(|m| {
+                    (
+                        clamp(m.tokens.input),
+                        clamp(m.tokens.output),
+                        clamp(m.tokens.cache_read),
+                        clamp(m.tokens.cache_write),
+                    )
+                })
+                .collect();
+            let mut sql = String::from(
+                "INSERT INTO usage_ledger \
+                 (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
+                 VALUES ",
             );
-            tx.execute(
-                "INSERT INTO usage_ledger
-                    (bucket_id, window_start, model,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                &[&bucket_id, &ws, &m.model, &ti, &to, &tcr, &tcw],
-            )
-            .store()?;
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + rows.len() * 5);
+            params.push(&bucket_id);
+            params.push(&ws);
+            for (i, (m, row)) in ledger.models.iter().zip(rows.iter()).enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = 3 + i * 5;
+                sql.push_str(&format!(
+                    "($1,$2,${},${},${},${},${})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4
+                ));
+                params.push(&m.model);
+                params.push(&row.0);
+                params.push(&row.1);
+                params.push(&row.2);
+                params.push(&row.3);
+            }
+            tx.execute(&sql, &params).store()?;
         }
         tx.commit().store()?;
         Ok(())
