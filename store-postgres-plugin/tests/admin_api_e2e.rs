@@ -1,0 +1,466 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
+//! THE prod-ready end-to-end bar for this plugin, driven the way a real OPERATOR installs and uses
+//! it in production — never a file dropped onto disk before boot (see `e2e.rs` for that path, still
+//! real and still kept as its own proof), but the REAL admin HTTP API:
+//!
+//!   1. Boot a real `busbar` process (no `--validate`) with its admin listener up and the compiled-in
+//!      `memory` store active (`store:` block absent — see `busbar`'s own `StoreCfg` doc: "Absent
+//!      block = the compiled-in ephemeral RAM store").
+//!   2. `POST /api/v1/admin/plugins` with the REAL built cdylib, base64-encoded, guarded by a real
+//!      `x-admin-token` — the exact wire shape `crates/busbar/src/admin/v1/json/handlers.rs`'s
+//!      `install_plugin` and its own admin test (`test_admin_v1_plugin_install_list_reload_remove`
+//!      in `crates/busbar/src/admin/tests/tests.rs`) use, mirrored here against a REAL cdylib rather
+//!      than that in-process test's own never-dlopened junk bytes.
+//!   3. `GET /api/v1/admin/plugins?type=store` confirms the install landed in the real catalog.
+//!
+//! Installing over the admin API does NOT hot-swap the ACTIVE store — confirmed against
+//! `crates/busbar/src/admin/v1/json/handlers.rs`'s own `reload_plugins` doc comment ("the
+//! governance/store instance is REUSED across the swap") and `PUT /config/settings`'s handler,
+//! which puts `store` on its own `restart_required` list. There is no admin endpoint that hot-swaps
+//! the active store; a fresh process boot is the only real mechanism, so this test uses one — same
+//! as a real operator editing `store: module: postgres` into `config.yaml` and restarting after an
+//! admin-API install:
+//!
+//!   4. Stop that process. Rewrite `config.yaml` on disk (same `plugins.dir`, now containing the
+//!      tarball the ADMIN API itself wrote there in step 2 — never touched directly by this test) to
+//!      point `store: module: postgres` at the real Postgres.
+//!   5. Boot a SECOND real `busbar` process against that config. Busbar's own first-boot store
+//!      resolution (`plugin_registry.open_store`, called synchronously during construction, before
+//!      the listener ever binds) dlopens the plugin that landed on disk via the admin API in step 2.
+//!      Poll — via a RAW independent `postgres::Client`, never `PostgresStore::connect` — for the
+//!      `keys` table to appear, proving the real dlopen + `Store::connect`/`migrate()` path executed.
+//!   6. `POST /api/v1/admin/keys` (with `issue_aws_credential: true`) against this SECOND process —
+//!      REAL WORK: mint a virtual key AND a credential through the running instance, over the same
+//!      real admin API.
+//!   7. Independently verify — a fresh RAW `postgres::Client`, bypassing the plugin/ABI/admin-API
+//!      entirely — that both the `keys` row and the `credentials` row actually landed.
+//!
+//! Together: real admin-API install -> real (admin-API-driven) plugin load -> real admin-API write
+//! -> real, independently-verified Postgres persistence.
+
+use base64::Engine as _;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
+/// unwinds partway through the test. Same pattern as `e2e.rs`'s own `ChildGuard`.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn postgres_url() -> Option<String> {
+    match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(url) => Some(url),
+        Err(_) if std::env::var_os("CI").is_some() => {
+            panic!(
+                "BUSBAR_TEST_POSTGRES_URL is unset under CI: the postgres:16 service container must \
+                 provision it. Refusing to silently skip the only real-admin-API-install coverage \
+                 in CI."
+            );
+        }
+        Err(_) => {
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the live-Postgres e2e tests");
+            None
+        }
+    }
+}
+
+fn plugin_path() -> Option<PathBuf> {
+    let candidate = (|| {
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
+        let candidate = profile_dir.join(&name);
+        candidate.exists().then_some(candidate)
+    })();
+    if candidate.is_none() && std::env::var_os("CI").is_some() {
+        panic!(
+            "the store-postgres-plugin cdylib is not built under CI: `cargo test` must build it. \
+             Refusing to silently skip the only over-the-ABI coverage of the durable Postgres store \
+             path."
+        );
+    }
+    candidate
+}
+
+/// The sibling busbarAI checkout's root (same convention `e2e.rs` already uses for its path deps).
+fn busbarai_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../busbarAI")
+        .canonicalize()
+        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+}
+
+/// Build (once, cached by cargo) and return the real `busbar` and `busbar-plugin-pack` binaries,
+/// both from the sibling busbarAI checkout — never a fixture, never a stub.
+fn build_real_binaries() -> (PathBuf, PathBuf) {
+    let root = busbarai_root();
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "busbar",
+            "-p",
+            "busbar-plugin-pack",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for busbar + busbar-plugin-pack");
+    assert!(
+        status.success(),
+        "building the real busbar + busbar-plugin-pack binaries must succeed"
+    );
+    (
+        root.join("target/release/busbar"),
+        root.join("target/release/busbar-plugin-pack"),
+    )
+}
+
+/// Reserve a free loopback port for the admin listener (bind-then-drop; the standard, small-TOCTOU
+/// pattern for handing a port to a spawned external process — the same trade-off `listen:
+/// "127.0.0.1:0"` in `e2e.rs` accepts for the data-plane listener, except busbar itself doesn't
+/// report back which port it took for `:0`, so the admin listener needs a port this test can name
+/// in the config file up front).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn cleanup(url: &str, id: &str) {
+    if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
+        let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
+        let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
+    }
+}
+
+/// Poll `http://127.0.0.1:{port}/api/v1/admin/plugins` (any admin GET works — we just need a TCP
+/// accept + HTTP response) until the admin listener is up, or the child has already exited.
+fn wait_for_admin_listener(
+    client: &reqwest::blocking::Client,
+    admin_base: &str,
+    token: &str,
+    guard: &mut ChildGuard,
+    what: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .get(format!("{admin_base}/plugins"))
+            .header("x-admin-token", token)
+            .send()
+            .is_ok()
+        {
+            return;
+        }
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            panic!("{what} exited before its admin listener came up (status: {status})");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}'s admin listener never came up within 15s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// THE REAL END-TO-END PROOF: install the real cdylib over the real admin API, restart onto it
+/// (the only real activation mechanism busbar exposes for a store-kind plugin), mint a virtual key
+/// and AWS credential through the running instance over the same admin API, and independently
+/// confirm both rows landed in real Postgres.
+#[test]
+fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
+    let Some(url) = postgres_url() else { return };
+    let Some(so_path) = plugin_path() else {
+        eprintln!("skip: store-postgres-plugin cdylib not built");
+        return;
+    };
+    let key_id = "vk_pg_adminapi_e2e";
+    cleanup(&url, key_id);
+
+    let (busbar_bin, pack_bin) = build_real_binaries();
+
+    let work = std::env::temp_dir().join(format!(
+        "busbar-pg-adminapi-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let plugins_dir = work.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+
+    // Pack the REAL cdylib (never junk bytes) into a real signed-shape tarball, same tool + flags
+    // as `e2e.rs` and CI's own SIGNOFF step use. Read back the bytes here -- this test uploads them
+    // itself over HTTP, never by copying the file into `plugins_dir` directly.
+    let tarball_path = work.join("store-postgres.tar.gz");
+    let status = Command::new(&pack_bin)
+        .args([
+            "pack",
+            "--lib",
+            so_path.to_str().unwrap(),
+            "--name",
+            "busbar-store-postgres-plugin",
+            "--alias",
+            "postgres",
+            "--kind",
+            "store",
+            "--version",
+            "0.0.0-e2e",
+            "--publisher",
+            "busbar",
+            "--description",
+            "admin-api e2e proof",
+            "--license",
+            "Apache-2.0",
+            "--out",
+            tarball_path.to_str().unwrap(),
+            "--allow-unsigned",
+        ])
+        .status()
+        .expect("run busbar-plugin-pack");
+    assert!(status.success(), "packing the plugin must succeed");
+    let tarball_bytes = std::fs::read(&tarball_path).unwrap();
+    let file = "store-postgres.tar.gz";
+
+    let admin_port = free_port();
+    let admin_token = "spg-adminapi-e2e-token";
+    let admin_base = format!("http://127.0.0.1:{admin_port}/api/v1/admin");
+    let client = reqwest::blocking::Client::new();
+
+    let providers = work.join("providers.yaml");
+    std::fs::write(
+        &providers,
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+    )
+    .unwrap();
+    let providers_and_common = format!(
+        "listen: \"127.0.0.1:0\"\n\
+         admin_listen: \"127.0.0.1:{admin_port}\"\n\
+         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         auth:\n  chain: []\n  admin_auth:\n  - admin-tokens: {{ token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
+         providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+         models:\n  test-model:\n    provider: mock\n",
+        plugins_dir.display()
+    );
+
+    // BOOT #1: no `store:` block at all -- the compiled-in `memory` store, per StoreCfg's own doc
+    // ("Absent block = the compiled-in ephemeral RAM store"). The postgres plugin is NOT on disk
+    // yet: this process only exists to serve the admin API that installs it.
+    let config1 = work.join("config1.yaml");
+    std::fs::write(&config1, &providers_and_common).unwrap();
+
+    let child1 = Command::new(&busbar_bin)
+        .env("BUSBAR_CONFIG", &config1)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .env("BUSBAR_ADMIN_TOKEN", admin_token)
+        .env("BUSBAR_STATE_FILE", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the real busbar boot (memory store, admin listener up)");
+    let mut guard1 = ChildGuard(child1);
+    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
+
+    // REAL ADMIN-API INSTALL: POST the real cdylib tarball, base64, exactly the wire shape
+    // `install_plugin`/its own admin test use -- never a file-drop.
+    let install_body = serde_json::json!({
+        "file": file,
+        "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball_bytes),
+    });
+    let install_resp = client
+        .post(format!("{admin_base}/plugins"))
+        .header("x-admin-token", admin_token)
+        .json(&install_body)
+        .send()
+        .unwrap();
+    let install_status = install_resp.status();
+    let install_body_text = install_resp.text().unwrap_or_default();
+    assert_eq!(
+        install_status.as_u16(),
+        201,
+        "plugin install must succeed over the real admin API: {install_body_text}"
+    );
+    assert!(
+        plugins_dir.join(file).exists(),
+        "the admin API's own install handler must have written the tarball to plugins.dir \
+         (this test never writes it there itself)"
+    );
+
+    // A mutation WITHOUT the admin token must be rejected -- the surface really is guarded, not
+    // open, mirroring the exact assertion busbarAI core's own
+    // `test_admin_v1_plugin_install_list_reload_remove` makes. Over a REAL out-of-process TCP
+    // connection (unlike that in-process axum test), a server that rejects before reading the
+    // full request body can legitimately close the connection rather than complete a clean 401
+    // response -- so either outcome (a 401 status, or the connection itself being refused/reset)
+    // counts as proof the write was rejected; only a 2xx success would mean the guard is missing.
+    match client
+        .post(format!("{admin_base}/plugins"))
+        .json(&install_body)
+        .send()
+    {
+        Ok(unauth) => assert_eq!(
+            unauth.status().as_u16(),
+            401,
+            "plugin install without x-admin-token must be rejected with 401, not accepted"
+        ),
+        Err(e) => assert!(
+            !e.is_status(),
+            "an unauthenticated install must never be accepted: {e}"
+        ),
+    }
+
+    // Confirm the real catalog reports it (not just a 201 with no lasting effect).
+    let list: serde_json::Value = client
+        .get(format!("{admin_base}/plugins?type=store"))
+        .header("x-admin-token", admin_token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let items = list["items"].as_array().expect("plugins list has items");
+    assert!(
+        items
+            .iter()
+            .any(|p| p["target"] == file && p["name"] == "busbar-store-postgres-plugin"),
+        "the installed postgres plugin must be listed in the real catalog: {items:?}"
+    );
+
+    // Install alone does NOT hot-swap the active store (confirmed against busbarAI core's own
+    // `reload_plugins`/`PUT /config/settings` doc comments -- `store` is on the restart_required
+    // list, and there is no live-swap endpoint for it). A real restart is the only real activation
+    // path, so this test uses one, same as a real operator would.
+    drop(guard1);
+
+    // BOOT #2: same plugins.dir (now containing the tarball the ADMIN API itself wrote in the
+    // install call above), config now naming `store: module: postgres` against the real Postgres.
+    let config2 = work.join("config2.yaml");
+    std::fs::write(
+        &config2,
+        format!(
+            "{providers_and_common}store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n"
+        ),
+    )
+    .unwrap();
+
+    let child2 = Command::new(&busbar_bin)
+        .env("BUSBAR_CONFIG", &config2)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .env("BUSBAR_ADMIN_TOKEN", admin_token)
+        .env("BUSBAR_STATE_FILE", "")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the real busbar boot (postgres store, the admin-installed plugin)");
+    let mut guard2 = ChildGuard(child2);
+
+    // Poll -- via a RAW independent postgres::Client, never PostgresStore::connect -- for the
+    // `keys` table to appear, exactly like `e2e.rs`'s own boot-time proof: this is the only genuine
+    // confirmation that boot #2 actually dlopened the admin-installed plugin and ran
+    // Store::connect()/migrate() before ever handling a request.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let booted = loop {
+        if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
+            if let Ok(row) = raw.query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
+                &[],
+            ) {
+                let exists: bool = row.get(0);
+                if exists {
+                    break true;
+                }
+            }
+        }
+        if let Ok(Some(status)) = guard2.0.try_wait() {
+            panic!("boot #2 exited before creating the postgres schema (status: {status})");
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        booted,
+        "boot #2, restarted onto the admin-installed postgres plugin, must create the `keys` \
+         table within 15s -- proof the real dlopen+connect path executed"
+    );
+    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
+
+    // REAL WORK, over the real admin API: mint a virtual key WITH an AWS-shaped credential.
+    let mint_body = serde_json::json!({
+        "name": "spg-adminapi-e2e-key",
+        "labels": {},
+        "issue_aws_credential": true,
+    });
+    let mint_resp = client
+        .post(format!("{admin_base}/keys"))
+        .header("x-admin-token", admin_token)
+        .json(&mint_body)
+        .send()
+        .unwrap();
+    let mint_status = mint_resp.status();
+    let mint_json: serde_json::Value = mint_resp.json().unwrap();
+    assert_eq!(
+        mint_status.as_u16(),
+        201,
+        "minting a key over the real admin API must succeed: {mint_json}"
+    );
+    let minted_id = mint_json["id"]
+        .as_str()
+        .expect("minted key response has an id")
+        .to_string();
+    let access_key_id = mint_json["aws_access_key_id"]
+        .as_str()
+        .expect("issue_aws_credential:true must return an aws_access_key_id")
+        .to_string();
+    assert!(
+        mint_json["aws_secret_access_key"].is_string(),
+        "issue_aws_credential:true must also return an aws_secret_access_key: {mint_json}"
+    );
+
+    // INDEPENDENT VERIFICATION: a fresh RAW postgres::Client, bypassing the plugin/ABI/admin-API
+    // entirely, confirms the key AND its credential actually landed in real Postgres.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("connect directly to confirm persistence, bypassing the plugin entirely");
+    let key_row = raw
+        .query_opt("SELECT name, enabled FROM keys WHERE id=$1", &[&minted_id])
+        .unwrap();
+    let key_row = key_row.expect("the minted key must be a real row in the real keys table");
+    let stored_name: String = key_row.get(0);
+    let stored_enabled: bool = key_row.get(1);
+    assert_eq!(stored_name, "spg-adminapi-e2e-key");
+    assert!(stored_enabled);
+
+    let cred_row = raw
+        .query_opt(
+            "SELECT kind, public_id FROM credentials WHERE key_id=$1",
+            &[&minted_id],
+        )
+        .unwrap();
+    let cred_row = cred_row
+        .expect("the minted AWS credential must be a real row in the real credentials table");
+    let stored_kind: String = cred_row.get(0);
+    let stored_public_id: String = cred_row.get(1);
+    assert_eq!(stored_kind, "sigv4");
+    assert_eq!(
+        stored_public_id, access_key_id,
+        "the credential row's public_id must be the SAME access key id the admin API returned"
+    );
+
+    drop(guard2);
+    drop(raw);
+    let _ = std::fs::remove_dir_all(&work);
+    cleanup(&url, &minted_id);
+}

@@ -28,3 +28,12 @@ serde_json = "1"
 # never shipped in the plugin artifact itself.
 busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
 postgres = "0.19"
+# For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an
+# OUT-OF-PROCESS busbar the same way e2e.rs drives busbar itself -- fully synchronous, no tokio
+# runtime (the plain `postgres` sync client used for independent verification can't be called from
+# inside an async/tokio context; `reqwest::blocking` sidesteps that entirely and keeps this test's
+# style consistent with e2e.rs). Same reqwest/base64 versions busbarAI core's own
+# crates/busbar/src/admin/tests/tests.rs uses, minus the async-only features it needs for its
+# in-process axum server.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+base64 = "0.22"
