@@ -295,11 +295,22 @@ impl PostgresStore {
             ))
             .store()?;
         let result = Self::migrate_locked(&mut client);
-        let _ = client.batch_execute(&format!(
+        let unlocked = client.batch_execute(&format!(
             "SELECT pg_advisory_unlock({})",
             Self::MIGRATE_LOCK_KEY
         ));
-        result
+        // A migration failure is the more important thing to report; don't mask it with an unlock
+        // failure. But if the migration itself SUCCEEDED and the unlock did not, that must not be
+        // swallowed: an un-released session-held advisory lock can hang a sibling node's connect()
+        // (which takes the same lock before its own migrate) for the remaining lifetime of this
+        // process's connection, with previously zero trace that it happened.
+        match (result, unlocked) {
+            (Ok(()), Err(e)) => Err(StoreError(format!(
+                "migrate: schema migration succeeded but releasing the advisory lock failed ({e}); \
+                 a sibling node's own migrate() may now hang waiting for this lock"
+            ))),
+            (result, _) => result,
+        }
     }
 
     fn migrate_locked(client: &mut Client) -> StoreResult<()> {
@@ -430,6 +441,14 @@ fn secret_form_from_storage(s: &str) -> SecretForm {
 }
 
 const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
+/// The row index of `secret` in `SELECT {CRED_META_COLUMNS},secret FROM credentials ...` -- always
+/// exactly the column COUNT of CRED_META_COLUMNS (12: id,key_id,kind,slot,public_id,secret_form,
+/// created_at,updated_at,expires_at,revoked_at,revoke_reason,revision -- indices 0-11), since every
+/// query that reads `secret` builds its SELECT by appending it right after that column list. Named
+/// here instead of a bare `12` at each call site; `debug_assert!` below catches drift if
+/// CRED_META_COLUMNS' column count ever changes without updating this constant to match, since
+/// `str::split` isn't const-evaluable in stable Rust.
+const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
 fn row_to_cred_meta(r: &Row) -> CredentialMeta {
     CredentialMeta {
@@ -534,11 +553,25 @@ impl Store for PostgresStore {
         let rev = Self::next_revision(&mut tx)?;
         tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
             .store()?;
-        tx.execute(
-            "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 WHERE id=$1",
-            &[&id, &rev, &rev],
-        )
-        .store()?;
+        // `AND deleted_at IS NULL` re-states the guard the SELECT above already checked, IN the
+        // UPDATE's own WHERE clause: under Postgres' READ COMMITTED semantics, an UPDATE takes a row
+        // lock and re-evaluates its WHERE against the post-lock committed data, so this closes the
+        // TOCTOU window the plain `SELECT` above cannot -- two concurrent delete_key calls on the
+        // same id now genuinely serialize (the loser's UPDATE matches 0 rows) instead of both
+        // unconditionally overwriting `deleted_at`/`revision` regardless of which committed first.
+        let changed = tx
+            .execute(
+                "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
+                 WHERE id=$1 AND deleted_at IS NULL",
+                &[&id, &rev, &rev],
+            )
+            .store()?;
+        // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
+        // same as the `Some(true)` branch above -- not an error.
+        if changed == 0 {
+            tx.commit().store()?;
+            return Ok(());
+        }
         tx.commit().store()?;
         Ok(())
     }
@@ -566,11 +599,26 @@ impl Store for PostgresStore {
             Some(true) => {}
         }
         let rev = Self::next_revision(&mut tx)?;
-        tx.execute(
-            "UPDATE keys SET name='', labels='{}', revision=$2 WHERE id=$1",
-            &[&id, &rev],
-        )
-        .store()?;
+        // `AND deleted_at IS NOT NULL` re-states the "must already be tombstoned" guard IN the
+        // UPDATE's own WHERE clause, closing the same TOCTOU class as delete_key above: the SELECT
+        // this function just ran is not atomic with this write, so without the re-check here a
+        // concurrent put_key/put_key_with_credential resurrecting the key between the SELECT and
+        // this UPDATE would let scrub_key silently erase name/labels on what is, by the time this
+        // statement lands, a LIVE key -- exactly the un-auditable-data-loss-on-an-active-principal
+        // this method's own doc comment says it must never do.
+        let changed = tx
+            .execute(
+                "UPDATE keys SET name='', labels='{}', revision=$2 \
+                 WHERE id=$1 AND deleted_at IS NOT NULL",
+                &[&id, &rev],
+            )
+            .store()?;
+        if changed == 0 {
+            return Err(StoreError(format!(
+                "scrub_key: key {id} was resurrected (deleted_at cleared) concurrently with this \
+                 call -- refusing to scrub a key that is live by the time the write landed"
+            )));
+        }
         tx.commit().store()?;
         Ok(())
     }
@@ -698,28 +746,45 @@ impl Store for PostgresStore {
             &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
         )
         .store()?;
-        for m in &delta.models {
-            tx.execute(
-                "INSERT INTO usage_ledger
-                    (bucket_id, window_start, model,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES ($1,$2,$3,GREATEST(0,$4::bigint),GREATEST(0,$5::bigint),GREATEST(0,$6::bigint),GREATEST(0,$7::bigint))
-                 ON CONFLICT (bucket_id, window_start, model) DO UPDATE SET
-                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + $4::bigint),
-                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + $5::bigint),
-                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + $6::bigint),
-                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + $7::bigint)",
-                &[
-                    &bucket_id,
-                    &ws,
-                    &m.model,
-                    &m.tokens.input,
-                    &m.tokens.output,
-                    &m.tokens.cache_read,
-                    &m.tokens.cache_write,
-                ],
-            )
-            .store()?;
+        if !delta.models.is_empty() {
+            // Batched into ONE multi-row INSERT instead of one round trip per model, mirroring
+            // put_usage's identical multi-row VALUES-list construction above for the same table.
+            let mut sql = String::from(
+                "INSERT INTO usage_ledger \
+                 (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
+                 VALUES ",
+            );
+            let mut params: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(2 + delta.models.len() * 5);
+            params.push(&bucket_id);
+            params.push(&ws);
+            for (i, m) in delta.models.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = 3 + i * 5;
+                sql.push_str(&format!(
+                    "($1,$2,${},GREATEST(0,${}::bigint),GREATEST(0,${}::bigint),GREATEST(0,${}::bigint),GREATEST(0,${}::bigint))",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4
+                ));
+                params.push(&m.model);
+                params.push(&m.tokens.input);
+                params.push(&m.tokens.output);
+                params.push(&m.tokens.cache_read);
+                params.push(&m.tokens.cache_write);
+            }
+            sql.push_str(
+                " ON CONFLICT (bucket_id, window_start, model) DO UPDATE SET \
+                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + EXCLUDED.tokens_input), \
+                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + EXCLUDED.tokens_output), \
+                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + EXCLUDED.tokens_cache_read), \
+                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + EXCLUDED.tokens_cache_write)",
+            );
+            tx.execute(&sql, &params).store()?;
         }
         tx.commit().store()?;
         Ok(())
@@ -845,7 +910,7 @@ impl Store for PostgresStore {
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
-                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision",
+                expires_at=EXCLUDED.expires_at, deleted_at=NULL, revision=EXCLUDED.revision",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
                 &key.group, &labels, &expires, &rev,
@@ -874,7 +939,9 @@ impl Store for PostgresStore {
         let row = self.lock().query_opt(&sql, &[&kind, &public_id]).store()?;
         Ok(row.map(|r| CredentialSecret {
             meta: row_to_cred_meta(&r),
-            secret: r.get::<_, Option<String>>(12).unwrap_or_default(),
+            secret: r
+                .get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
+                .unwrap_or_default(),
         }))
     }
 
@@ -898,9 +965,20 @@ impl Store for PostgresStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // `AND revoked_at IS NULL`: mirrors delete_key's `already_deleted` idempotency (see above) --
+        // a repeat revoke_credential call on an already-revoked row must be a true no-op, not bump
+        // the global revision / rewrite revoke_reason+updated_at every time it's called. Stated IN
+        // the UPDATE's own WHERE clause (not just the `exists` SELECT above) so this is also
+        // TOCTOU-safe: two concurrent revoke_credential calls on the same id now genuinely
+        // serialize under Postgres' READ COMMITTED row-lock re-check, and only the first to commit
+        // actually changes anything.
+        // Return value intentionally unread: whether this call or a concurrent winner actually
+        // changed the row, the outcome is the same idempotent success -- matching delete_key's
+        // shape. `next_revision`'s bump above going unused in the losing case is acceptable per its
+        // own doc (a monotonic counter with gaps).
         tx.execute(
-            "UPDATE credentials SET revoked_at=COALESCE(revoked_at,$2), revoke_reason=$3, updated_at=$2, revision=$4
-             WHERE id=$1",
+            "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4
+             WHERE id=$1 AND revoked_at IS NULL",
             &[&id, &clamp(now), &reason, &rev],
         )
         .store()?;
@@ -917,22 +995,30 @@ impl Store for PostgresStore {
             .iter()
             .map(|r| CredentialSecret {
                 meta: row_to_cred_meta(r),
-                secret: r.get::<_, Option<String>>(12).unwrap_or_default(),
+                secret: r
+                    .get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
+                    .unwrap_or_default(),
             })
             .collect())
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
         let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
-        self.lock()
+        // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
+        // never rewrites or recomputes the digest" (busbar_api::Store::append_audit doc). `seq` is a
+        // per-process counter (see the engine's own known caveat about clustered nodes), so a
+        // collision here means either a real caller bug or two nodes racing on the same seq -- in
+        // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
+        // without any trace. Failing loudly on a collision is strictly safer than the alternative:
+        // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
+        // integrity guarantees it claims to hold.
+        let inserted = self
+            .lock()
             .execute(
                 "INSERT INTO audit_log
                     (seq, ts, action, resource, outcome, principal, prev_hash, hash)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (seq) DO UPDATE SET
-                    ts=EXCLUDED.ts, action=EXCLUDED.action, resource=EXCLUDED.resource,
-                    outcome=EXCLUDED.outcome, principal=EXCLUDED.principal,
-                    prev_hash=EXCLUDED.prev_hash, hash=EXCLUDED.hash",
+                 ON CONFLICT (seq) DO NOTHING",
                 &[
                     &seq,
                     &ts,
@@ -945,29 +1031,27 @@ impl Store for PostgresStore {
                 ],
             )
             .store()?;
+        if inserted == 0 {
+            return Err(StoreError(format!(
+                "append_audit: seq {} already exists in audit_log; refusing to silently overwrite \
+                 a durable audit entry (the append-only contract forbids rewriting a prior hash)",
+                entry.seq
+            )));
+        }
         Ok(())
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
-        let rows = self
-            .lock()
-            .query(
-                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash
-                 FROM audit_log ORDER BY seq",
-                &[],
-            )
-            .store()?;
+        let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq");
+        let rows = self.lock().query(&sql, &[]).store()?;
         Ok(rows.iter().map(row_to_audit).collect())
     }
 
     fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+        let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq DESC LIMIT $1");
         let rows = self
             .lock()
-            .query(
-                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash
-                 FROM audit_log ORDER BY seq DESC LIMIT $1",
-                &[&i64::try_from(limit).unwrap_or(i64::MAX)],
-            )
+            .query(&sql, &[&i64::try_from(limit).unwrap_or(i64::MAX)])
             .store()?;
         let mut out: Vec<AuditRecord> = rows.iter().map(row_to_audit).collect();
         out.reverse();
@@ -990,6 +1074,8 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 }
+
+const AUDIT_COLUMNS: &str = "seq, ts, action, resource, outcome, principal, prev_hash, hash";
 
 fn row_to_audit(r: &Row) -> AuditRecord {
     AuditRecord {
@@ -1025,7 +1111,7 @@ impl PostgresStore {
             .execute(
                 "INSERT INTO credentials
                     (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,NULL,NULL,$10)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11)
                  ON CONFLICT (key_id, kind, slot) DO UPDATE SET
                     id=EXCLUDED.id, public_id=EXCLUDED.public_id, secret=EXCLUDED.secret,
                     secret_form=EXCLUDED.secret_form, updated_at=EXCLUDED.updated_at,
@@ -1041,6 +1127,7 @@ impl PostgresStore {
                     &secret_val,
                     &form,
                     &clamp(m.created_at),
+                    &clamp(m.updated_at),
                     &expires,
                     &rev,
                 ],
