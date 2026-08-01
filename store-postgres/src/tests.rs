@@ -651,3 +651,502 @@ fn metering_roundtrip_new_fields() {
     assert_eq!(row.key_group_at_use, "growth");
     assert_eq!(row.pricing_version, "2026-07");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Mutation-testing gap fixes (cargo-mutants round 1 against this file): each test below is named
+// for, and directly targets, one or more MISSED mutants -- confirmed red against the mutant before
+// being folded in green here.
+// ---------------------------------------------------------------------------------------------
+
+/// `percent_decode`'s length guard and hi/lo-nibble arithmetic, pinned with cases the existing
+/// `p%40ss`/`bad%zz` coverage doesn't reach: a `lo` of 0 (as in `%40`) makes `hi*16+lo` and
+/// `hi*16-lo` compute the same value, so a nonzero `lo` is needed to distinguish `+` from `-`; and
+/// neither existing case puts a bare `%` within 2 bytes of the end of the string, so the `i + 2 <
+/// len` guard's `+` was never distinguished from `*` (which, at `i=1` on a 3-byte string, would
+/// wrongly pass the guard and index one byte past the end).
+#[test]
+fn percent_decode_edge_cases() {
+    assert_eq!(
+        percent_decode("%41"),
+        "A",
+        "a nonzero low nibble must be added, not subtracted"
+    );
+    assert_eq!(
+        percent_decode("a%1"),
+        "a%1",
+        "a '%' with only one trailing hex digit must be left completely literal, never panic"
+    );
+    assert_eq!(
+        percent_decode("abc%"),
+        "abc%",
+        "a trailing bare '%' with no hex digits must be left literal, never panic"
+    );
+}
+
+/// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
+/// recognize from every other error class -- pinned against two REAL postgres errors (never a
+/// hand-built one, since `postgres::Error` has no public constructor) so both the `==`/`!=` and the
+/// whole-function true/false mutants are caught.
+#[test]
+fn is_undefined_table_matches_only_the_real_sqlstate() {
+    let Some(url) = live_url() else { return };
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+
+    let missing = client
+        .query_opt(
+            "SELECT 1 FROM spg_this_table_definitely_does_not_exist_xyz",
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        is_undefined_table(&missing),
+        "a query against a genuinely missing table must be classified as undefined_table: {missing}"
+    );
+
+    let syntax_err = client.query_opt("SELEC 1", &[]).unwrap_err();
+    assert!(
+        !is_undefined_table(&syntax_err),
+        "a syntax error must NOT be misclassified as undefined_table: {syntax_err}"
+    );
+}
+
+/// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
+/// non-empty label set. `sample_key`'s `Default::default()` labels are empty, and `serde_json` of
+/// an empty `BTreeMap` is `"{}"`, the SAME string `labels_to_storage`'s own error fallback returns,
+/// so a mutant that replaced the whole function with `String::new()` still round-tripped an empty
+/// map back to an empty map -- only a NON-empty label set can tell `"{}"` (correct) apart from `""`
+/// (the mutant), since `labels_from_storage("")` also happens to default to an empty map.
+#[test]
+fn labels_round_trip_non_empty_map() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    hard_reset(&store, "vk_labels_rt");
+
+    let mut k = sample_key("vk_labels_rt");
+    k.labels = std::collections::BTreeMap::from([
+        ("team".to_string(), "growth".to_string()),
+        ("env".to_string(), "prod".to_string()),
+    ]);
+    store.put_key(&k).unwrap();
+    let back = store.get_key("vk_labels_rt").unwrap().unwrap();
+    assert_eq!(back.labels.get("team").map(String::as_str), Some("growth"));
+    assert_eq!(back.labels.get("env").map(String::as_str), Some("prod"));
+    assert_eq!(back.labels.len(), 2);
+}
+
+/// `secret_form_to_storage`/`secret_form_from_storage` for all three `SecretForm` variants, pure
+/// (no DB needed) and independent of which credential fixtures happen to default to `Recoverable`
+/// elsewhere -- catches a deleted `"recoverable"` or `"digest"` match arm silently falling through
+/// to the `_ => SecretForm::None` catch-all.
+#[test]
+fn secret_form_storage_round_trip_all_variants() {
+    assert_eq!(secret_form_to_storage(SecretForm::None), "none");
+    assert_eq!(
+        secret_form_to_storage(SecretForm::Recoverable),
+        "recoverable"
+    );
+    assert_eq!(secret_form_to_storage(SecretForm::Digest), "digest");
+
+    assert_eq!(secret_form_from_storage("none"), SecretForm::None);
+    assert_eq!(
+        secret_form_from_storage("recoverable"),
+        SecretForm::Recoverable
+    );
+    assert_eq!(secret_form_from_storage("digest"), SecretForm::Digest);
+    assert_eq!(
+        secret_form_from_storage("garbage"),
+        SecretForm::None,
+        "an unrecognized stored value must fail safe to None, not panic"
+    );
+}
+
+/// `put_usage`/`add_usage`'s multi-row `VALUES (...)` batching (comma insertion gated on `i > 0`,
+/// and each row's placeholder `base = 3 + i * 5`) is only exercised by a call with 2+ models -- every
+/// existing test used exactly one model, so `i > 0` vs `i < 0`, and `+`/`*` in the offset arithmetic,
+/// were never distinguished (with one model, `i` is always 0, and both branches degenerate to the
+/// same single-row SQL).
+#[test]
+fn put_usage_and_add_usage_batch_multiple_models_correctly() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let bucket = "vk_multi_model_batch";
+    let ws = 20_270_401u64;
+    let ws2 = ws + 1;
+    for w in [ws, ws2] {
+        let _ = store.lock().execute(
+            "DELETE FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &clamp(w)],
+        );
+        let _ = store.lock().execute(
+            "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &clamp(w)],
+        );
+    }
+
+    store
+        .put_usage(
+            bucket,
+            ws,
+            &UsageLedger {
+                requests: 3,
+                billable_requests: 2,
+                models: vec![
+                    ModelTokens {
+                        model: "model-a".into(),
+                        tokens: TierTokens {
+                            input: 10,
+                            output: 20,
+                            cache_read: 1,
+                            cache_write: 2,
+                        },
+                    },
+                    ModelTokens {
+                        model: "model-b".into(),
+                        tokens: TierTokens {
+                            input: 30,
+                            output: 40,
+                            cache_read: 3,
+                            cache_write: 4,
+                        },
+                    },
+                    ModelTokens {
+                        model: "model-c".into(),
+                        tokens: TierTokens {
+                            input: 50,
+                            output: 60,
+                            cache_read: 5,
+                            cache_write: 6,
+                        },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+    let got = store.get_usage(bucket, ws).unwrap();
+    let mut models = got.models;
+    models.sort_by(|a, b| a.model.cmp(&b.model));
+    assert_eq!(
+        models.len(),
+        3,
+        "all three model rows must land as three distinct, correctly delimited rows"
+    );
+    assert_eq!(models[0].model, "model-a");
+    assert_eq!(models[0].tokens.input, 10);
+    assert_eq!(models[0].tokens.output, 20);
+    assert_eq!(models[1].model, "model-b");
+    assert_eq!(models[1].tokens.input, 30);
+    assert_eq!(models[1].tokens.cache_write, 4);
+    assert_eq!(models[2].model, "model-c");
+    assert_eq!(models[2].tokens.cache_read, 5);
+    assert_eq!(models[2].tokens.cache_write, 6);
+
+    store
+        .add_usage(
+            bucket,
+            ws2,
+            &UsageDelta {
+                requests: 1,
+                billable_requests: 1,
+                models: vec![
+                    ModelTokensDelta {
+                        model: "model-x".into(),
+                        tokens: TierTokensDelta {
+                            input: 7,
+                            output: 8,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    },
+                    ModelTokensDelta {
+                        model: "model-y".into(),
+                        tokens: TierTokensDelta {
+                            input: 9,
+                            output: 11,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    let got2 = store.get_usage(bucket, ws2).unwrap();
+    let mut models2 = got2.models;
+    models2.sort_by(|a, b| a.model.cmp(&b.model));
+    assert_eq!(
+        models2.len(),
+        2,
+        "both delta model rows must land distinctly"
+    );
+    assert_eq!(models2[0].model, "model-x");
+    assert_eq!(models2[0].tokens.input, 7);
+    assert_eq!(models2[1].model, "model-y");
+    assert_eq!(models2[1].tokens.output, 11);
+}
+
+/// `append_audit`'s append-only contract: a seq collision must be rejected, never silently
+/// overwritten (the trait's own doc: "a store never rewrites or recomputes the digest"). Previously
+/// entirely untested -- `append_audit`/`AuditRecord` didn't appear anywhere in this file.
+#[test]
+fn append_audit_is_append_only_and_rejects_a_seq_collision() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let seq = 900_000_001u64;
+    let _ = store
+        .lock()
+        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+
+    let entry = AuditRecord {
+        seq,
+        ts: 1_700_000_000,
+        action: "hook.register".into(),
+        resource: "hook:compress".into(),
+        outcome: "applied".into(),
+        principal: "vk_audit_test".into(),
+        prev_hash: String::new(),
+        hash: "hash-1".into(),
+    };
+    store.append_audit(&entry).unwrap();
+
+    let mut colliding = entry.clone();
+    colliding.hash = "hash-2-different".into();
+    colliding.outcome = "rejected".into();
+    let err = store
+        .append_audit(&colliding)
+        .expect_err("a seq collision must be rejected, never silently accepted as an overwrite");
+    assert!(
+        err.0.contains(&seq.to_string()),
+        "the collision error should name the colliding seq: {}",
+        err.0
+    );
+
+    // The original entry must survive UNCHANGED -- proof this was truly rejected, not partially
+    // applied. Queried directly by seq (never list_audit_tail), so this can't race a concurrent
+    // test's own unrelated audit_log rows.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let row = client
+        .query_one(
+            "SELECT hash, outcome FROM audit_log WHERE seq=$1",
+            &[&clamp(seq)],
+        )
+        .unwrap();
+    let hash: String = row.get(0);
+    let outcome: String = row.get(1);
+    assert_eq!(
+        hash, "hash-1",
+        "the original entry's hash must not have been overwritten"
+    );
+    assert_eq!(outcome, "applied");
+
+    let _ = store
+        .lock()
+        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+}
+
+/// A unique-enough suffix (pid + nanos) for names that must not collide across concurrently
+/// running test binaries against the SAME shared Postgres instance (this repo's own `e2e.rs` uses
+/// the identical pattern for its temp work directory).
+fn unique_suffix() -> String {
+    format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Split a `postgres://user:pass@host:port/db` URL into its `(userinfo, host:port, db)` parts.
+/// This crate's own test fixtures (and `dsn_password`'s own parsing) already assume this exact
+/// shape, so no more general a parser is needed here.
+fn split_url(url: &str) -> (&str, &str, &str) {
+    let rest = url.split("://").nth(1).expect("url must have a scheme");
+    let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
+    let (host_port, db) = host_and_db
+        .split_once('/')
+        .expect("url must have a db path");
+    (userinfo, host_port, db)
+}
+
+fn isolated_db_url(url: &str, db_name: &str) -> String {
+    let (userinfo, host_port, _) = split_url(url);
+    format!("postgres://{userinfo}@{host_port}/{db_name}")
+}
+
+fn role_url(url: &str, db_name: &str, user: &str, pass: &str) -> String {
+    let (_, host_port, _) = split_url(url);
+    format!("postgres://{user}:{pass}@{host_port}/{db_name}")
+}
+
+fn create_fresh_database(url: &str, db_name: &str) {
+    let mut maint = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    let _ = maint.execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[]);
+    maint
+        .execute(&format!("CREATE DATABASE {db_name}"), &[])
+        .unwrap();
+}
+
+fn drop_database(url: &str, db_name: &str) {
+    if let Ok(mut maint) = postgres::Client::connect(url, postgres::NoTls) {
+        let _ = maint.execute(
+            &format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"),
+            &[],
+        );
+    }
+}
+
+/// `migrate_locked`'s undefined-table bootstrap path AND its legacy-table drop, together, on a
+/// genuinely fresh (separate, disposable) database rather than the shared test database -- which,
+/// once any test has run against it, never again presents an undefined `busbar_schema` or a
+/// version < `SCHEMA_VERSION`, so this code was structurally unreachable from every other test in
+/// this file.
+#[test]
+fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
+    let Some(url) = live_url() else { return };
+    let db = format!("spg_fresh_{}", unique_suffix());
+    create_fresh_database(&url, &db);
+    let iso_url = isolated_db_url(&url, &db);
+
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute("CREATE TABLE virtual_keys (id TEXT PRIMARY KEY)")
+            .unwrap();
+    }
+
+    let store = PostgresStore::connect(&iso_url).expect("connect must bootstrap a fresh database");
+
+    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    let legacy_gone: bool = check
+        .query_one("SELECT to_regclass('virtual_keys') IS NULL", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        legacy_gone,
+        "a fresh database's pre-existing legacy virtual_keys table must be dropped on bootstrap"
+    );
+    let version: i64 = check
+        .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        version, SCHEMA_VERSION,
+        "a fresh database must land on the current schema version"
+    );
+
+    drop(store);
+    drop(check);
+    drop_database(&url, &db);
+}
+
+/// The mirror image of the test above: a database ALREADY at `SCHEMA_VERSION` must skip the
+/// legacy-table check entirely, never touching a table that merely happens to share a legacy name.
+/// Distinguishes `<` from `==`/`<=` at the exact boundary (`version == SCHEMA_VERSION`), which the
+/// fresh-database test (`version` starts at 0) cannot: at 0, `<`, `<=`, and (against a nonzero
+/// SCHEMA_VERSION) `==`'s complement all happen to agree closely enough that only the equality
+/// boundary itself tells them apart.
+#[test]
+fn migrate_already_at_current_version_skips_the_legacy_check() {
+    let Some(url) = live_url() else { return };
+    let db = format!("spg_atver_{}", unique_suffix());
+    create_fresh_database(&url, &db);
+    let iso_url = isolated_db_url(&url, &db);
+
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(&format!(
+            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             INSERT INTO busbar_schema (version) VALUES ({SCHEMA_VERSION});
+             CREATE TABLE virtual_keys (id TEXT PRIMARY KEY);"
+        ))
+        .unwrap();
+    }
+
+    let store = PostgresStore::connect(&iso_url).expect("connect");
+
+    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    let legacy_still_there: bool = check
+        .query_one("SELECT to_regclass('virtual_keys') IS NOT NULL", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        legacy_still_there,
+        "a database already at SCHEMA_VERSION must not run the legacy-table-drop check at all"
+    );
+
+    drop(store);
+    drop(check);
+    drop_database(&url, &db);
+}
+
+/// `migrate`/`migrate_locked` must never silently succeed against a role that lacks real read
+/// access to its own bookkeeping table -- built with a role granted CREATE/INSERT but deliberately
+/// NEVER SELECT on `busbar_schema`, so a genuine SQLSTATE 42501 (insufficient_privilege) surfaces
+/// somewhere in `migrate_locked`'s statement sequence (Postgres requires SELECT on the target table
+/// for `INSERT ... ON CONFLICT`, even `DO NOTHING`, confirmed empirically against this exact
+/// fixture -- not just for the version-probe `SELECT` itself), and `connect()` must propagate that
+/// as an `Err`, never proceed as if the database were merely fresh.
+///
+/// NOTE on `is_undefined_table(&e)` at the `migrate_locked` match guard (line ~324): that specific
+/// branch is unreachable via ANY fixture reachable from this test file, confirmed by hand-patching
+/// it to hardcoded `true` and to hardcoded `false` and observing `connect()`'s behavior is
+/// unchanged in both cases -- `migrate_locked` unconditionally runs `CREATE TABLE IF NOT EXISTS
+/// busbar_schema` as its very first statement, so by the time the guarded `SELECT` runs, the table
+/// either already exists (guard never fires) or the preceding `CREATE TABLE` itself already
+/// propagated the error several lines earlier (guard never reached). This is a confirmed equivalent
+/// mutant / dead branch given the current code structure, not a test-coverage gap; left unfixed
+/// per policy (no test written to "kill" it, since none can, without changing the source itself --
+/// out of scope for a mutation-testing coverage pass).
+#[test]
+fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
+    let Some(url) = live_url() else { return };
+    let db = format!("spg_perm_{}", unique_suffix());
+    create_fresh_database(&url, &db);
+    let iso_url = isolated_db_url(&url, &db);
+    let role = format!("spg_limited_{}", unique_suffix());
+
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'limited';
+             GRANT CREATE, USAGE ON SCHEMA public TO {role};
+             CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             GRANT INSERT ON busbar_schema TO {role};"
+        ))
+        .unwrap();
+        // Deliberately NO SELECT grant on busbar_schema.
+    }
+
+    let limited_url = role_url(&url, &db, &role, "limited");
+
+    // Sanity-check the fixture itself, independently (raw client, never through the store): the
+    // probe query must fail with insufficient_privilege, never undefined_table, or this test would
+    // prove nothing.
+    {
+        let mut raw = postgres::Client::connect(&limited_url, postgres::NoTls).unwrap();
+        let probe_err = raw
+            .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+            .unwrap_err();
+        assert_eq!(
+            probe_err.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "test setup sanity: the probe query must fail with insufficient_privilege, not \
+             undefined_table, for this test to mean anything: {probe_err}"
+        );
+        assert!(!is_undefined_table(&probe_err));
+    }
+
+    assert!(
+        PostgresStore::connect(&limited_url).is_err(),
+        "migrate must never silently succeed against a role that can't actually read its own \
+         bookkeeping table"
+    );
+
+    let mut cleanup = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    let _ = cleanup.batch_execute(&format!(
+        "DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"
+    ));
+    drop(cleanup);
+    drop_database(&url, &db);
+}
