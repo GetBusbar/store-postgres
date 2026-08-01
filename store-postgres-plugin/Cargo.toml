@@ -9,7 +9,14 @@ description = "First-party signed kind:store plugin cdylib: the Postgres backend
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]   # cdylib for the C ABI delivery; all the SQL/logic lives in busbar-store-postgres
+# cdylib for the C ABI delivery (all the SQL/logic lives in busbar-store-postgres); rlib matches the
+# sibling plugins' convention (auth-oidc-plugin, webrequest-hook) and is REQUIRED for `cargo test` to
+# actually emit the cdylib artifact at all — with cdylib-only, `cargo test --workspace` builds a
+# trivial "0 tests" harness for this package but never produces the .so/.dylib, so
+# tests/admin_api_e2e.rs's own dlopen of its "real built cdylib" silently found nothing (confirmed:
+# `find target/release -iname '*store_postgres_plugin*'` after a bare `cargo test --workspace
+# --release` showed no .so, only the test harness binary).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # busbar-store-postgres is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs —

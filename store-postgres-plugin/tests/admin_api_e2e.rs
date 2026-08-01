@@ -73,19 +73,39 @@ fn postgres_url() -> Option<String> {
     }
 }
 
+/// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
+/// build target of the invocation, e.g. `cargo build --all-targets`) and the raw
+/// `<profile_dir>/deps/<name>` compiler output (refreshed on every build that recompiles the lib,
+/// uplifted or not). A bare `cargo test --release` (what `release-check.sh`'s Phase 2 runs, and what
+/// cargo-mutants runs) does NOT uplift the cdylib to the top-level profile dir, only to
+/// `target/deps` — checking only `profile_dir` silently finds nothing and this test's CI hard-panic
+/// fires even though the cdylib really was built (confirmed against `release-check.sh`'s CI run:
+/// "the store-postgres-plugin cdylib is not built under CI" despite the prior `cargo test
+/// --workspace --release` step compiling it). Same fix already applied to auth-oidc-plugin's and
+/// webrequest-hook's equivalent `plugin_path()`/`webrequest_cdylib()` helpers.
 fn plugin_path() -> Option<PathBuf> {
     let candidate = (|| {
         let exe = std::env::current_exe().ok()?;
         let profile_dir = exe.parent()?.parent()?;
         let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-        let candidate = profile_dir.join(&name);
-        candidate.exists().then_some(candidate)
+        let uplifted = profile_dir.join(&name);
+        let raw = profile_dir.join("deps").join(&name);
+        [uplifted, raw]
+            .into_iter()
+            .filter_map(|p| {
+                std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (p, mtime))
+            })
+            .max_by_key(|(_, mtime)| *mtime)
+            .map(|(p, _)| p)
     })();
     if candidate.is_none() && std::env::var_os("CI").is_some() {
         panic!(
-            "the store-postgres-plugin cdylib is not built under CI: `cargo test` must build it. \
-             Refusing to silently skip the only over-the-ABI coverage of the durable Postgres store \
-             path."
+            "the store-postgres-plugin cdylib is not built under CI: `cargo test` must build it \
+             (checked both the uplifted target dir and target/deps). Refusing to silently skip the \
+             only over-the-ABI coverage of the durable Postgres store path."
         );
     }
     candidate
