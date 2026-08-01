@@ -6,7 +6,21 @@
 //! `postgres:16`.
 
 use super::*;
-use busbar_api::{CredentialMeta, CredentialSecret, SecretForm};
+use busbar_api::{CredentialMeta, CredentialSecret, ModelTokensDelta, SecretForm, TierTokensDelta};
+
+/// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
+/// `CRED_META_COLUMNS`' own column count, since `str::split` isn't const-evaluable and the constant
+/// is hand-maintained. Catches the class of bug where a column is added/removed from
+/// CRED_META_COLUMNS without updating the index every `secret` read relies on.
+#[test]
+fn cred_secret_column_index_matches_cred_meta_columns_count() {
+    assert_eq!(
+        CRED_META_COLUMNS.split(',').count(),
+        CRED_SECRET_COLUMN_INDEX,
+        "CRED_SECRET_COLUMN_INDEX must equal CRED_META_COLUMNS' column count -- update it if you \
+         changed CRED_META_COLUMNS"
+    );
+}
 
 /// L2: a connect-error string must never leak the DSN password.
 #[test]
@@ -185,6 +199,55 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
     );
 }
 
+/// put_key_with_credential's ON CONFLICT path must clear a stale tombstone: re-minting over an id
+/// that was previously deleted (deleted_at set, enabled=false by delete_key) must produce a fully
+/// LIVE key, not one that is enabled=true while still marked deleted_at.
+///
+/// RED-BEFORE-GREEN: reverting the ON CONFLICT UPDATE SET clause to omit `deleted_at=NULL` (its
+/// state before this fix) makes this test fail at the `deleted_at` assertion below: `enabled` flips
+/// to `true` as the caller intended, but `deleted_at` is left at whatever the tombstone set it to,
+/// so the row is simultaneously "enabled" and "deleted" -- exactly the corrupt state this test
+/// guards against. Confirmed by temporarily reverting the fix and re-running: this assertion failed.
+#[test]
+fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_remint_over_tombstone1";
+    hard_reset(&store, id);
+
+    let key = sample_key(id);
+    let cred = sample_cred(id, 0, "AKIA_REMINT1");
+    store.put_key_with_credential(&key, &cred).unwrap();
+    store.delete_key(id).unwrap();
+    let tombstoned = store.get_key(id).unwrap().unwrap();
+    assert!(tombstoned.deleted_at.is_some(), "precondition: tombstoned");
+    assert!(!tombstoned.enabled, "precondition: disabled");
+
+    // Re-mint over the same id: a fresh VirtualKey with enabled=true and no deleted_at, atomically
+    // paired with a fresh credential, exactly like an operator re-issuing a revoked key.
+    let mut remint = sample_key(id);
+    remint.enabled = true;
+    remint.deleted_at = None;
+    let remint_cred = sample_cred(id, 0, "AKIA_REMINT1_NEW");
+    store
+        .put_key_with_credential(&remint, &remint_cred)
+        .expect("re-mint over a tombstoned id must succeed, not violate keys_tombstone_disabled");
+
+    let after = store.get_key(id).unwrap().unwrap();
+    assert!(after.enabled, "the re-minted key must be enabled");
+    assert!(
+        after.deleted_at.is_none(),
+        "the re-minted key must have its stale tombstone cleared, not be simultaneously enabled \
+         and deleted: got deleted_at={:?}",
+        after.deleted_at
+    );
+    assert_eq!(
+        store.list_credentials(id).unwrap().len(),
+        1,
+        "the re-minted credential must be present"
+    );
+}
+
 /// scrub_key: PII-erasure only, requires the key to already be tombstoned.
 #[test]
 fn scrub_key_requires_tombstone_first() {
@@ -253,6 +316,41 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
         .unwrap()
         .expect("re-mint into a revoked slot must succeed");
     assert_eq!(resolved.meta.slot, 0);
+}
+
+/// put_credential_tx must bind CredentialMeta::updated_at to its own column, not silently reuse
+/// created_at's parameter for both.
+///
+/// RED-BEFORE-GREEN: reverting the fix (VALUES ...,$8,$8,$9,... binding created_at's placeholder
+/// twice, with `updated_at` never bound at all) makes this test fail: the round-tripped
+/// `updated_at` comes back equal to `created_at` (100) instead of the distinct value (200) this
+/// test mints with. Confirmed by temporarily reverting and re-running: assertion failed with
+/// `left: 100, right: 200`.
+#[test]
+fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_updated_at1";
+    hard_reset(&store, id);
+    store.put_key(&sample_key(id)).unwrap();
+
+    let mut cred = sample_cred(id, 0, "AKIA_UPDATEDAT1");
+    cred.meta.created_at = 100;
+    cred.meta.updated_at = 200;
+    store.put_credential(&cred).unwrap();
+
+    let got = store
+        .list_credentials(id)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.public_id == "AKIA_UPDATEDAT1")
+        .expect("the minted credential must be listed");
+    assert_eq!(got.created_at, 100, "created_at must round-trip untouched");
+    assert_eq!(
+        got.updated_at, 200,
+        "updated_at must round-trip as its own distinct value, not be silently overwritten by \
+         created_at's"
+    );
 }
 
 /// revoke_credential kills ONE credential independent of the key: the key stays enabled, the OTHER
@@ -338,6 +436,16 @@ fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() 
         "the delta must show the key as tombstoned"
     );
 
+    // First confirm the credential is ACTUALLY gone -- without this, the "no delta" check below is
+    // tautological: a credential that was simply left untouched by a broken delete_key would ALSO
+    // produce zero deltas past the watermark (nothing ever wrote a new revision for it), making the
+    // two cases indistinguishable to that assertion alone.
+    assert!(
+        store.list_credentials(id).unwrap().is_empty(),
+        "delete_key must have hard-deleted the credential row for a correct baseline to compare \
+         the delta behavior below against"
+    );
+
     // The credential delta, by contrast, is NOT required to (and structurally cannot) show the
     // deletion -- this is the exact gap. A correct hydrator must react to the KEY delta's
     // deleted_at, not wait for a credential delta that will never come.
@@ -381,8 +489,7 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     assert!(store_a.list_credentials(id).unwrap().is_empty());
 }
 
-/// get_usage's REPEATABLE READ snapshot must not tear: a concurrent add_usage landing between the
-/// requests-row read and the model-rows read must not be half-visible.
+/// get_usage's REPEATABLE READ helper must actually open that isolation level.
 #[test]
 fn get_usage_transaction_is_actually_repeatable_read() {
     let Some(url) = live_url() else { return };
@@ -398,7 +505,119 @@ fn get_usage_transaction_is_actually_repeatable_read() {
         level, "repeatable read",
         "get_usage's helper must actually open REPEATABLE READ"
     );
-    let _ = store.get_usage("nonexistent_bucket", 0); // smoke: still callable
+    let got = store.get_usage("nonexistent_bucket", 0);
+    assert!(got.is_ok(), "get_usage must still be callable: {got:?}");
+}
+
+/// THE actual torn-read proof the previous test's docstring used to promise but never ran: a
+/// concurrent add_usage landing between get_usage's requests-row read and its model-rows read must
+/// not be half-visible. Drives get_usage's own two-step read manually (its real SQL, via the same
+/// `snapshot_consistent_tx` helper it uses internally) so a write can be deliberately interleaved
+/// between the two steps on a SEPARATE connection, then asserts REPEATABLE READ's snapshot held: the
+/// second read still sees the pre-interleave state, not the concurrent writer's new model row.
+///
+/// RED-BEFORE-GREEN: this test is a genuine regression guard rather than a fresh finding (get_usage
+/// already opens REPEATABLE READ via snapshot_consistent_tx) -- confirmed non-vacuous by temporarily
+/// downgrading snapshot_consistent_tx's isolation level to READ COMMITTED and re-running: the
+/// `model_count` assertion below failed (it observed the interleaved writer's new model row), then
+/// passed again after restoring REPEATABLE READ.
+#[test]
+fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let bucket = "vk_torn_read1";
+    let ws = 20_270_301u64;
+    hard_reset(&store, bucket);
+    let _ = store
+        .lock()
+        .execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&bucket]);
+    let _ = store
+        .lock()
+        .execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&bucket]);
+
+    // Seed one model row so the "before" state is non-empty and distinguishable from "after".
+    store
+        .put_usage(
+            bucket,
+            ws,
+            &UsageLedger {
+                requests: 10,
+                billable_requests: 10,
+                models: vec![ModelTokens {
+                    model: "seed-model".into(),
+                    tokens: TierTokens {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                }],
+            },
+        )
+        .unwrap();
+
+    // Open the snapshot and take the FIRST of get_usage's two reads (the requests row) manually.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
+    let _requests_row = tx
+        .query_one(
+            "SELECT requests, billable_requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &clamp(ws)],
+        )
+        .unwrap();
+
+    // Interleave: a SEPARATE connection commits an add_usage that adds a brand-new model row and
+    // bumps requests, fully committed before this transaction's second read runs.
+    let interleaved = PostgresStore::connect(&url).expect("second connection");
+    interleaved
+        .add_usage(
+            bucket,
+            ws,
+            &UsageDelta {
+                requests: 5,
+                billable_requests: 5,
+                models: vec![ModelTokensDelta {
+                    model: "concurrent-writer-model".into(),
+                    tokens: TierTokensDelta {
+                        input: 1,
+                        output: 1,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                }],
+            },
+        )
+        .unwrap();
+
+    // The SECOND read, same transaction/snapshot: under REPEATABLE READ this must still see only
+    // the pre-interleave model row, not the concurrent writer's new one.
+    let model_rows = tx
+        .query(
+            "SELECT model FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &clamp(ws)],
+        )
+        .unwrap();
+    tx.commit().unwrap();
+
+    let models: Vec<String> = model_rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        models,
+        vec!["seed-model".to_string()],
+        "a REPEATABLE READ snapshot must not observe a model row committed by a concurrent \
+         add_usage after this transaction began; observed: {models:?}"
+    );
+
+    // Sanity: the interleaved write DID land for a fresh read (proves it wasn't silently a no-op).
+    let after = store.get_usage(bucket, ws).unwrap();
+    assert_eq!(
+        after.requests, 15,
+        "the concurrent add_usage must have applied for a fresh read"
+    );
+    assert_eq!(
+        after.models.len(),
+        2,
+        "both models must be present for a fresh read"
+    );
 }
 
 /// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
