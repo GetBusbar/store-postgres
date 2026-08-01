@@ -8,19 +8,28 @@
 //!
 //! `load_and_exercise_postgres_plugin_via_file_drop` instead: packs the built cdylib into a real
 //! tarball (the same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real
-//! `plugins.dir`, and runs the REAL `busbar --validate` binary against a config naming
+//! `plugins.dir`, and boots a REAL `busbar` process (no `--validate`) against a config naming
 //! `store: { module: postgres }` — the documented file-drop install path (see
-//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery). `--validate` genuinely
-//! exercises the trust gate + ABI dlopen + `Store::connect` (real schema migration against real
-//! Postgres), so a successful validate is real proof the plugin loads and initializes through
-//! busbar's own boot path, not a proxy for it.
+//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery).
+//!
+//! `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by design
+//! ("no server, no network, no state, no dlopen" — `crates/busbar/src/main.rs`'s own `--help` text)
+//! and never opens the store, so checking the schema after `--validate` alone would prove nothing
+//! about the real boot path. A clean `--validate` run first proves the file-dropped plugin passes
+//! the trust/manifest gate; then a REAL BOOT (no `--validate` flag) is the only thing that actually
+//! `dlopen`s the plugin and runs `Store::connect`/migration (busbar's own gate-assembly code calls
+//! `plugin_registry.open_store` synchronously during construction, before the listener ever binds —
+//! see `crates/busbar/src/main.rs`), so that's what proves the persistence claim.
 //!
 //! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
 //! this part was always sound, only the LOADING mechanism was wrong):
-//!   1. `--validate` itself (via the plugin's `open()`) causes a real `PostgresStore::connect`, which
-//!      runs the real schema migration — confirmed by checking the schema now exists.
-//!   2. A second, independent `PostgresStore::connect` (bypassing the plugin/ABI/loader entirely)
-//!      confirms real Postgres was actually touched, not an in-process fake.
+//!   1. The real boot process is polled, via a RAW independent `postgres::Client` connection (never
+//!      `PostgresStore::connect`, so this check can't accidentally create the schema itself), for
+//!      the `keys` table to appear within a timeout — proof the real dlopen + `Store::connect`/
+//!      migrate path executed during boot, not a proxy for it. If boot never opens the store, or
+//!      exits early, this poll times out / the child-exit check fires, and the test fails.
+//!   2. Only AFTER that proof, a second, independent `PostgresStore::connect` (bypassing the
+//!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
 //!
 //! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
 //! are DELIBERATELY left calling `load_store()` directly — they test the loader's own error-surface
@@ -31,7 +40,20 @@
 
 use busbar_store_postgres::PostgresStore;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
+/// unwinds partway through the test (unlike a manual `child.kill()` call placed after the code that
+/// might panic, which never runs if an earlier assertion fails first).
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 fn postgres_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
@@ -113,9 +135,9 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
-/// `busbar --validate` against a config naming `store: { module: postgres }`, and confirm real
-/// Postgres was actually touched — via the documented file-drop mechanism, never a direct
-/// `load_store()` call.
+/// `busbar --validate` against a config naming `store: { module: postgres }` (trust/manifest gate
+/// proof), then boot a REAL `busbar` process (no `--validate`) and poll for real Postgres to
+/// actually be touched — via the documented file-drop mechanism, never a direct `load_store()` call.
 #[test]
 fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(url) = postgres_url() else { return };
@@ -198,6 +220,12 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     )
     .unwrap();
 
+    // `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by
+    // design ("no server, no network, no state, no dlopen" -- crates/busbar/src/main.rs's own
+    // `--help` text) and never opens the store. A clean `--validate` run first proves the
+    // file-dropped plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag,
+    // below) is the only thing that actually `dlopen`s the plugin and runs
+    // `Store::connect`/migration.
     let out = Command::new(&busbar_bin)
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
@@ -211,27 +239,58 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // PROOF real Postgres was touched by the REAL busbar process, through the REAL file-drop path:
-    // an independent connection (bypassing the plugin/ABI/loader entirely) confirms the schema now
-    // exists -- --validate's own plugin-open call ran Store::connect, which runs migrate(). Also
-    // exercises PostgresStore::connect itself as the second independent-verification leg the prior
-    // direct-call test used.
-    let _direct = PostgresStore::connect(&url)
-        .expect("connect directly, bypassing the plugin entirely, to confirm real schema init");
-    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    let exists: bool = raw
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
-            &[],
-        )
-        .unwrap()
-        .get(0);
+    // REAL BOOT: run the actual gateway process (no --validate) against the same file-dropped
+    // plugin + config, and poll -- via a RAW independent postgres::Client connection, never
+    // PostgresStore::connect, so this check can't accidentally create the schema itself -- for the
+    // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
+    // and called Store::connect (which runs migrate()) before ever handling a request.
+    let child = Command::new(&busbar_bin)
+        .env("BUSBAR_CONFIG", &config)
+        .env("BUSBAR_PROVIDERS", &providers)
+        .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a real busbar boot");
+    let mut guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let booted = loop {
+        if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
+            if let Ok(row) = raw.query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
+                &[],
+            ) {
+                let exists: bool = row.get(0);
+                if exists {
+                    break true;
+                }
+            }
+        }
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            panic!("busbar exited before creating the postgres schema (status: {status})");
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
-        exists,
-        "the keys table must exist after busbar --validate loaded the plugin via file-drop -- \
-         proof the real boot path actually called Store::connect/migrate, not a no-op"
+        booted,
+        "a real busbar boot with the file-dropped postgres plugin must create the `keys` table \
+         (via Store::connect/migrate) within 15s -- proof the real dlopen+connect path executed \
+         during boot, not a no-op"
     );
 
+    // Only AFTER that proof: a second, independent PostgresStore::connect (bypassing the
+    // plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema the
+    // real boot process just created.
+    let _direct = PostgresStore::connect(&url).expect(
+        "connect directly, bypassing the plugin entirely, to confirm the schema the real boot \
+         created is usable",
+    );
+
+    drop(guard); // explicit: stop the real busbar process before cleanup
     let _ = std::fs::remove_dir_all(&work);
     cleanup(&url, key_id);
 }

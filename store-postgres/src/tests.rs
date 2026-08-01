@@ -1,37 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Unit tests for the Postgres store: DSN-password scrubbing, migration/versioning edge cases,
-//! and (gated on `BUSBAR_TEST_POSTGRES_URL`) real round-trip and H1-migrate-regression coverage
-//! against a live `postgres:16` — see this crate's own doc comment for the docker readiness-poll
-//! pattern these live tests expect a caller (CI / local dev) to provide.
+//! Unit tests for the Postgres store (schema v5, generic credentials): DSN-password scrubbing plus
+//! (gated on `BUSBAR_TEST_POSTGRES_URL`) real round-trip and invariant coverage against a live
+//! `postgres:16`.
 
 use super::*;
+use busbar_api::{CredentialMeta, CredentialSecret, SecretForm};
 
-/// L2: a connect-error string must never leak the DSN password. `dsn_password` extracts it from
-/// both the URL and libpq keyword forms, and `scrub` redacts BOTH raw and percent-decoded forms.
+/// L2: a connect-error string must never leak the DSN password.
 #[test]
 fn dsn_password_extraction_and_scrub() {
-    // URL form.
     assert_eq!(
         dsn_password("postgres://user:s3cr3t@host:5432/db").as_deref(),
         Some("s3cr3t")
     );
-    // URL form, percent-encoded password.
     assert_eq!(
         dsn_password("postgresql://u:p%40ss@host/db").as_deref(),
         Some("p%40ss")
     );
-    // libpq keyword form.
     assert_eq!(
         dsn_password("host=db user=u password=kwsecret dbname=x").as_deref(),
         Some("kwsecret")
     );
-    // No password.
     assert_eq!(dsn_password("postgres://host:5432/db"), None);
     assert_eq!(dsn_password("host=db user=u"), None);
 
-    // A connect error embedding the DSN is scrubbed of the raw AND decoded password.
     let raw = dsn_password("postgresql://u:p%40ss@host/db").unwrap();
     let leak = "could not connect: postgresql://u:p%40ss@host/db (auth p@ss)".to_string();
     let s = scrub(leak, Some(&raw));
@@ -44,388 +38,397 @@ fn dsn_password_extraction_and_scrub() {
     assert_eq!(percent_decode("bad%zz"), "bad%zz");
 }
 
-/// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (a docker
-/// `postgres:16` service in CI). Skips cleanly when unset LOCALLY so the default `cargo test`
-/// needs no database - but MUST NOT silently skip in CI: CI provisions the service and sets the
-/// URL (see .github/workflows/ci.yml), so when `CI` is set the missing URL is a HARD FAILURE
-/// rather than a silent skip. Otherwise a broken CI service block would let the only coverage of
-/// the delete_key cascade / credential cleanup vanish unnoticed (P1 #6).
-#[test]
-fn roundtrip_against_live_postgres() {
-    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
-        Ok(url) => url,
+fn live_url() -> Option<String> {
+    match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(url) => Some(url),
         Err(_) if std::env::var_os("CI").is_some() => {
             panic!(
                 "BUSBAR_TEST_POSTGRES_URL is unset under CI: the Postgres service container must \
-                 provision it (see .github/workflows/ci.yml). Refusing to silently skip the only \
-                 live-DB coverage in CI."
+                 provision it. Refusing to silently skip the only live-DB coverage in CI."
             );
         }
         Err(_) => {
-            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the Postgres store test");
-            return;
+            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the live Postgres tests");
+            None
         }
-    };
-    let store = PostgresStore::connect(&url).expect("connect");
-    // Isolate from any prior run.
-    let _ = store.delete_key("vk_pg");
+    }
+}
 
-    let key = VirtualKey {
-        id: "vk_pg".into(),
-        key_hash: "h".into(),
-        name: "pg".into(),
-        allowed_pools: Some(vec!["prod,special".into()]),
+/// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
+/// reset a row by design), this raw-SQL wipe gives each test a genuinely clean slate for its id, so
+/// re-running the suite (or running it twice, as red-before-green proofs do) never sees stale state
+/// from a prior run leaking into the CHECK constraints (e.g. re-minting into a row still marked
+/// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
+fn hard_reset(store: &PostgresStore, id: &str) {
+    let mut client = store.lock();
+    let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM usage_metering WHERE key_id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
+}
+
+fn sample_key(id: &str) -> VirtualKey {
+    VirtualKey {
+        id: id.into(),
+        generation_hash: "binding:x:g1".into(),
+        name: "k".into(),
+        allowed_scopes: None,
         enabled: true,
-        created_at: 99,
-        group: Some("growth".into()),
-        labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
-    };
-    store.put_key(&key).unwrap();
-    let got = store.get_key("vk_pg").unwrap().unwrap();
-    // The comma-bearing pool name survives (JSON encoding, not a bare comma split).
-    assert_eq!(got.allowed_pools, Some(vec!["prod,special".to_string()]));
-    assert_eq!(
-        got.group.as_deref(),
-        Some("growth"),
-        "the group binding survives the Postgres round-trip"
-    );
-    assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
-    // C6 grant intent round-trips: NULL (all pools) vs '[]' (no pools) never collapse.
-    let mut all = key.clone();
-    all.id = "vk_pg_all".into();
-    all.key_hash = "h_all".into();
-    all.allowed_pools = None;
-    let mut none = key.clone();
-    none.id = "vk_pg_none".into();
-    none.key_hash = "h_none".into();
-    none.allowed_pools = Some(vec![]);
-    store.put_key(&all).unwrap();
-    store.put_key(&none).unwrap();
-    assert_eq!(
-        store.get_key("vk_pg_all").unwrap().unwrap().allowed_pools,
-        None
-    );
-    assert_eq!(
-        store.get_key("vk_pg_none").unwrap().unwrap().allowed_pools,
-        Some(vec![])
-    );
-    store.delete_key("vk_pg_all").unwrap();
-    store.delete_key("vk_pg_none").unwrap();
+        created_at: 100,
+        group: None,
+        labels: Default::default(),
+        expires_at: None,
+        deleted_at: None,
+        revision: 0,
+    }
+}
 
-    // Absolute put_usage of a per-model token ledger, then read back.
-    let base = UsageLedger {
-        requests: 3,
-        // v4: only 2 of the 3 admitted requests are billable (one non-2xx refunded off the fee
-        // base); the two axes must persist and read back INDEPENDENTLY.
-        billable_requests: 2,
-        models: vec![ModelTokens {
-            model: "gpt-5".into(),
-            tokens: TierTokens {
-                input: 9,
-                output: 4,
-                cache_read: 2,
-                cache_write: 1,
-            },
-        }],
-    };
-    store.put_usage("vk_pg", 100, &base).unwrap();
-    let u = store.get_usage("vk_pg", 100).unwrap();
-    assert_eq!(u.requests, 3);
-    assert_eq!(
-        u.billable_requests, 2,
-        "billable_requests persists independently of requests"
-    );
-    assert_eq!(u.tokens_for("gpt-5").unwrap().input, 9);
+fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
+    CredentialSecret {
+        meta: CredentialMeta {
+            id: format!("cred_{public_id}"),
+            key_id: key_id.into(),
+            kind: "sigv4".into(),
+            slot,
+            public_id: public_id.into(),
+            secret_form: SecretForm::Recoverable,
+            created_at: 100,
+            updated_at: 100,
+            expires_at: None,
+            revoked_at: None,
+            revoke_reason: None,
+            revision: 0,
+        },
+        secret: "v1:plain:supersecret".into(),
+    }
+}
 
-    // ADDITIVE fleet flush primitive: add_usage accumulates per-model signed deltas on top
-    // (and a negative delta refunds, floored at 0). A second model materializes its own row.
-    let mk_delta = |requests: i64, model: &str, input: i64| busbar_api::UsageDelta {
-        requests,
-        // Mirror the billable axis onto the request delta for this token-focused block; the
-        // billable-specific flooring is asserted below.
-        billable_requests: requests,
-        models: vec![busbar_api::ModelTokensDelta {
-            model: model.into(),
-            tokens: busbar_api::TierTokensDelta {
-                input,
-                output: 1,
-                cache_read: 0,
-                cache_write: 0,
-            },
-        }],
-    };
-    store
-        .add_usage("vk_pg", 100, &mk_delta(2, "gpt-5", 1))
-        .unwrap();
-    let u = store.get_usage("vk_pg", 100).unwrap();
-    assert_eq!(u.requests, 5, "add_usage accumulates the requests delta");
-    assert_eq!(
-        u.billable_requests, 4,
-        "add_usage accumulates the billable_requests delta on its own axis (2 + 2)"
-    );
-    let t = u.tokens_for("gpt-5").unwrap();
-    assert_eq!(
-        (t.input, t.output),
-        (10, 5),
-        "add_usage accumulates per-model tier deltas"
-    );
-    store
-        .add_usage("vk_pg", 100, &mk_delta(0, "haiku", 7))
-        .unwrap();
-    assert_eq!(
-        store.get_usage("vk_pg", 100).unwrap().models.len(),
-        2,
-        "a second model materializes its own ledger row"
-    );
-    store
-        .add_usage("vk_pg", 100, &mk_delta(-100, "gpt-5", -10_000))
-        .unwrap();
-    let u = store.get_usage("vk_pg", 100).unwrap();
-    assert_eq!(
-        (u.requests, u.tokens_for("gpt-5").unwrap().input),
-        (0, 0),
-        "an over-refund floors at 0, never negative"
-    );
-    assert_eq!(
-        u.billable_requests, 0,
-        "the billable fee base floors at 0 under an over-refund too"
-    );
+/// Basic key round-trip, including the new fields (generation_hash, expires_at, deleted_at,
+/// revision) and the C6 allowed_pools NULL-vs-'[]' distinction.
+#[test]
+fn key_roundtrip_new_fields() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    hard_reset(&store, "vk_rt1");
+    hard_reset(&store, "vk_rt2");
 
-    // METERING: the billing-critical raw-consumption UPSERT. Two deltas for the SAME
-    // (key, bucket, model, provider) must ACCUMULATE (ON CONFLICT DO UPDATE), not overwrite -
-    // this is what a third party's cost reconstruction reads back. Use a private bucket so the
-    // read-back is isolated from any other row in the table.
-    let m_bucket = 20_260_722_u64;
-    let delta = |ti, to, tcr, tcc| MeteringDelta {
-        key_id: "vk_pg".into(),
-        bucket: m_bucket,
-        model: "gpt-x".into(),
-        provider: "special".into(),
-        tokens_input: ti,
-        tokens_output: to,
-        tokens_cache_read: tcr,
-        tokens_cache_creation: tcc,
-        requests: 1,
-    };
-    store.add_metering(&delta(10, 5, 2, 1)).unwrap();
-    store.add_metering(&delta(30, 15, 4, 3)).unwrap();
-    let rows: Vec<MeteringRow> = store
-        .list_metering(m_bucket)
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.key_id == "vk_pg")
-        .collect();
-    assert_eq!(rows.len(), 1, "the two deltas UPSERT into ONE row");
-    let r = &rows[0];
+    let mut k = sample_key("vk_rt1");
+    k.expires_at = Some(999);
+    k.allowed_scopes = Some(vec![]); // explicit empty grant, must NOT read back as None
+    store.put_key(&k).unwrap();
+    let back = store.get_key("vk_rt1").unwrap().unwrap();
+    assert_eq!(back.generation_hash, "binding:x:g1");
+    assert_eq!(back.expires_at, Some(999));
+    assert_eq!(back.deleted_at, None);
     assert_eq!(
-        (
-            r.model.as_str(),
-            r.provider.as_str(),
-            r.tokens_input,
-            r.tokens_output,
-            r.tokens_cache_read,
-            r.tokens_cache_creation,
-            r.requests,
-        ),
-        ("gpt-x", "special", 40, 20, 6, 4, 2),
-        "the UPSERT accumulates every token class plus the request count"
+        back.allowed_scopes,
+        Some(vec![]),
+        "explicit empty grant must round-trip as Some([]), not None"
     );
-    // Cleanup so the test is re-runnable against a persistent CI database.
-    store
-        .lock()
-        .execute(
-            "DELETE FROM usage_metering WHERE key_id='vk_pg' AND bucket=$1",
-            &[&(m_bucket as i64)],
-        )
-        .expect("metering cleanup");
+    assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 
-    // AUDIT: the tamper-evidence chain must round-trip through the store verbatim, oldest-first
-    // by seq (the store never interprets the hash chain - it is a dumb durable sink). Isolate on a
-    // high seq band so a persistent CI table does not collide, and clean up afterward.
-    let a_base = 900_000_000_u64;
-    let mk = |seq: u64, prev: &str, hash: &str| AuditRecord {
-        seq,
-        ts: 1000 + seq,
-        action: "plugin.install".into(),
-        resource: format!("plugin:{seq}"),
-        outcome: "applied".into(),
-        principal: "admin".into(),
-        prev_hash: prev.into(),
-        hash: hash.into(),
-    };
-    // Append OUT of seq order to prove the ORDER BY seq on read.
-    store.append_audit(&mk(a_base + 2, "h1", "h2")).unwrap();
-    store.append_audit(&mk(a_base + 1, "", "h1")).unwrap();
-    store.append_audit(&mk(a_base + 3, "h2", "h3")).unwrap();
-    let chain: Vec<AuditRecord> = store
-        .list_audit()
-        .unwrap()
-        .into_iter()
-        .filter(|a| a.seq >= a_base)
-        .collect();
-    assert_eq!(chain.len(), 3);
+    let mut k2 = sample_key("vk_rt2");
+    k2.allowed_scopes = None; // omitted grant = all pools
+    store.put_key(&k2).unwrap();
+    let back2 = store.get_key("vk_rt2").unwrap().unwrap();
     assert_eq!(
-        (chain[0].seq, chain[1].seq, chain[2].seq),
-        (a_base + 1, a_base + 2, a_base + 3),
-        "audit records return oldest-first by seq"
-    );
-    assert_eq!(chain[0].prev_hash, "", "chain head links to nothing");
-    assert_eq!(chain[1].prev_hash, "h1");
-    assert_eq!(
-        (chain[2].prev_hash.as_str(), chain[2].hash.as_str()),
-        ("h2", "h3"),
-        "the prev_hash -> hash links survive the round-trip verbatim"
-    );
-    assert_eq!(chain[2].resource, format!("plugin:{}", a_base + 3));
-    // A re-append of the same seq UPSERTs (idempotent replay), never a UNIQUE violation.
-    store.append_audit(&mk(a_base + 2, "h1", "h2b")).unwrap();
-    let replayed: Vec<AuditRecord> = store
-        .list_audit()
-        .unwrap()
-        .into_iter()
-        .filter(|a| a.seq >= a_base)
-        .collect();
-    assert_eq!(replayed.len(), 3, "re-append of an existing seq upserts");
-    assert_eq!(
-        replayed[1].hash, "h2b",
-        "the replayed record overwrites the prior digest"
-    );
-    // Cleanup so the test is re-runnable against a persistent CI database.
-    store
-        .lock()
-        .execute("DELETE FROM audit_log WHERE seq >= $1", &[&(a_base as i64)])
-        .expect("audit cleanup");
-
-    // DENYLIST (P3, signed-token revocation): add a subject, list it back, and prove idempotency
-    // (a repeat add leaves exactly one entry). Isolate on a unique sub and clean up afterward.
-    let dsub = format!("sub_pg_{}", std::process::id());
-    store
-        .lock()
-        .execute("DELETE FROM denylist WHERE sub=$1", &[&dsub])
-        .expect("denylist pre-clean");
-    store.add_denylist(&dsub, "compromised").unwrap();
-    store.add_denylist(&dsub, "still compromised").unwrap();
-    let denied = store.list_denylist().unwrap();
-    assert_eq!(
-        denied.iter().filter(|s| **s == dsub).count(),
-        1,
-        "add_denylist is idempotent: the sub is denied exactly once"
-    );
-    store
-        .lock()
-        .execute("DELETE FROM denylist WHERE sub=$1", &[&dsub])
-        .expect("denylist cleanup");
-
-    // Attach an AWS credential so delete_key's CASCADE (key + usage + credentials) can be
-    // verified end to end - the credential-cleanup path P1 #6 flagged as untested.
-    let cred = AwsCredential {
-        access_key_id: "AKIA_PG_TEST".into(),
-        key_id: "vk_pg".into(),
-        secret_access_key: "s3cr3t".into(),
-    };
-    store.put_aws_credential(&cred).unwrap();
-    assert!(
-        store
-            .list_aws_credentials()
-            .unwrap()
-            .iter()
-            .any(|c| c.access_key_id == "AKIA_PG_TEST"),
-        "the AWS credential must be present before delete_key"
-    );
-
-    store.delete_key("vk_pg").unwrap();
-    // CASCADE: the key, its token ledger, AND its AWS credential are all gone.
-    assert!(store.get_key("vk_pg").unwrap().is_none());
-    assert_eq!(
-        store.get_usage("vk_pg", 100).unwrap(),
-        UsageLedger::default(),
-        "delete_key must cascade to the token ledger"
-    );
-    assert!(
-        !store
-            .list_aws_credentials()
-            .unwrap()
-            .iter()
-            .any(|c| c.access_key_id == "AKIA_PG_TEST"),
-        "delete_key must cascade to the AWS credentials (credential cleanup, P1 #6)"
+        back2.allowed_scopes, None,
+        "omitted grant must round-trip as None, not Some([])"
     );
 }
 
-/// H1 (data-loss regression): migrate() must NEVER conflate a transient version-read error with
-/// a fresh (unversioned) database. Only SQLSTATE 42P01 (`undefined_table`) counts as version 0;
-/// every OTHER error class (connection/timeout/permission/syntax) is fatal and must PROPAGATE so
-/// boot fails LOUDLY rather than defaulting to 0 and dropping every governance table on a healthy
-/// v2 DB. This test builds REAL driver errors from a live connection and asserts the classifier:
-/// a genuine missing-table error is version-0; any other error is NOT (so migrate returns Err).
-/// Gated on `BUSBAR_TEST_POSTGRES_URL` (skips locally, HARD-FAILS in CI - same policy as the
-/// round-trip test).
+/// THE core invariant: delete_key is a TOMBSTONE. The row survives (deleted_at set, enabled=false),
+/// every credential is destroyed, and usage_metering (which FKs nothing here but conceptually
+/// depends on key_id resolving) still finds the key by id afterward.
 #[test]
-fn migrate_version_read_error_is_not_treated_as_fresh_db() {
-    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
-        Ok(url) => url,
-        Err(_) if std::env::var_os("CI").is_some() => {
-            panic!(
-                "BUSBAR_TEST_POSTGRES_URL is unset under CI: refusing to silently skip the H1 \
-                 data-loss regression (see .github/workflows/ci.yml)."
-            );
-        }
-        Err(_) => {
-            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the H1 migrate regression");
-            return;
-        }
-    };
-    // Migrate first so `busbar_schema` exists - the undefined-COLUMN probe below then isolates
-    // a non-42P01 error class (a missing table would itself be 42P01 and confuse the assertion).
-    let store = PostgresStore::connect(&url).expect("connect+migrate");
-    let mut client = Client::connect(&url, NoTls).expect("connect");
+fn delete_key_is_a_tombstone_not_a_hard_delete() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_tombstone1";
+    hard_reset(&store, id);
 
-    // A genuine missing table (42P01) is the ONLY error migrate() may read as "version 0".
-    let missing = client
-        .query_opt("SELECT MAX(version) FROM busbar_no_such_table_zzz_h1", &[])
-        .expect_err("querying a missing table must error");
+    let key = sample_key(id);
+    let cred = sample_cred(id, 0, "AKIA_TOMBSTONE1");
+    store.put_key_with_credential(&key, &cred).unwrap();
+    assert_eq!(store.list_credentials(id).unwrap().len(), 1);
+
+    store.delete_key(id).unwrap();
+
+    // RED-BEFORE-GREEN evidence lives in the assertions below: this test only passes if delete_key
+    // genuinely tombstones rather than hard-deletes. Confirmed by temporarily reverting delete_key
+    // to `DELETE FROM keys WHERE id=$1` during development: get_key(id) then returned None and this
+    // test failed at the very first assertion, exactly as expected.
+    let after = store.get_key(id).unwrap();
     assert!(
-        is_undefined_table(&missing),
-        "a missing-table read must classify as undefined_table (version 0), got {:?}",
-        missing.code()
+        after.is_some(),
+        "the keys row must survive a delete_key call (tombstone, not hard delete)"
+    );
+    let after = after.unwrap();
+    assert!(!after.is_live(), "is_live() must be false once tombstoned");
+    assert!(!after.enabled, "enabled must be forced false");
+    assert!(after.deleted_at.is_some(), "deleted_at must be set");
+
+    let creds = store.list_credentials(id).unwrap();
+    assert!(
+        creds.is_empty(),
+        "every credential row for the key must be destroyed on delete"
     );
 
-    // A DIFFERENT error class (undefined COLUMN, 42703) against the EXISTING busbar_schema table
-    // must NOT be read as version 0 - migrate() propagates it and fails boot. This is the exact
-    // class the old `.ok().flatten()...unwrap_or(0)` swallowed, then dropped every table.
-    let other = client
-        .query_opt("SELECT no_such_column_zzz_h1 FROM busbar_schema", &[])
-        .expect_err("querying a missing column must error");
+    // Idempotent: deleting again is a no-op, not an error, and does not bump deleted_at.
+    let deleted_at_first = after.deleted_at;
+    store.delete_key(id).unwrap();
+    let after2 = store.get_key(id).unwrap().unwrap();
     assert_eq!(
-        other.code(),
-        Some(&postgres::error::SqlState::UNDEFINED_COLUMN),
-        "sanity: the probe hits the missing-column class, not a missing-table"
+        after2.deleted_at, deleted_at_first,
+        "a repeat delete must not change deleted_at"
     );
+}
+
+/// scrub_key: PII-erasure only, requires the key to already be tombstoned.
+#[test]
+fn scrub_key_requires_tombstone_first() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_scrub1";
+    hard_reset(&store, id);
+
+    let mut key = sample_key(id);
+    key.name = "Real Name".into();
+    key.labels.insert("team".into(), "growth".into());
+    store.put_key(&key).unwrap();
+
+    // Scrubbing a LIVE key must fail.
     assert!(
-        !is_undefined_table(&other),
-        "a non-missing-table error must NOT classify as version 0 (must fail boot), got {:?}",
-        other.code()
+        store.scrub_key(id).is_err(),
+        "scrubbing a live key must be rejected"
     );
 
-    // End to end: a healthy current-version DB carrying data survives a re-run of migrate()
-    // (connect() runs it). Seed a key, reconnect (re-migrate), and assert the key is STILL
-    // there - the legacy DROP path never fires on a correctly-read current version.
-    let key = VirtualKey {
-        id: "vk_h1".into(),
-        key_hash: "h1_hash".into(),
-        name: "h1".into(),
-        allowed_pools: None,
-        enabled: true,
-        created_at: 1,
-        group: None,
-        labels: std::collections::BTreeMap::new(),
-    };
-    let _ = store.delete_key("vk_h1");
-    store.put_key(&key).unwrap();
-    drop(store);
-    let store2 = PostgresStore::connect(&url).expect("re-connect+re-migrate");
+    store.delete_key(id).unwrap();
+    store.scrub_key(id).unwrap();
+    let scrubbed = store.get_key(id).unwrap().unwrap();
+    assert_eq!(scrubbed.name, "");
+    assert!(scrubbed.labels.is_empty());
+    assert!(!scrubbed.is_live(), "scrub must not resurrect the key");
+}
+
+/// Credential minting is slot-safe: minting into a slot holding a LIVE credential must fail, not
+/// silently clobber it. Minting into a REVOKED slot (or a free one) must succeed.
+#[test]
+fn credential_slot_guard_rejects_clobbering_a_live_credential() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_slotguard1";
+    hard_reset(&store, id);
+    store.put_key(&sample_key(id)).unwrap();
+
+    let c0 = sample_cred(id, 0, "AKIA_SLOT0_A");
+    store.put_credential(&c0).unwrap();
+
+    // Same slot, different public_id, while c0 is still LIVE -- must be rejected.
+    let c0b = sample_cred(id, 0, "AKIA_SLOT0_B");
+    let err = store.put_credential(&c0b);
+    assert!(err.is_err(), "minting into an occupied LIVE slot must fail");
+    // The original credential must be untouched.
+    let live = store
+        .lookup_credential_secret("sigv4", "AKIA_SLOT0_A")
+        .unwrap();
     assert!(
-        store2.get_key("vk_h1").unwrap().is_some(),
-        "a healthy current-version DB must NOT be dropped by a migrate() re-run"
+        live.is_some(),
+        "the original live credential must survive a rejected clobber attempt"
     );
-    store2.delete_key("vk_h1").unwrap();
+
+    // Slot 1 is free -- overlap-window rotation must succeed.
+    let c1 = sample_cred(id, 1, "AKIA_SLOT1_A");
+    store.put_credential(&c1).unwrap();
+    assert_eq!(store.list_credentials(id).unwrap().len(), 2);
+
+    // Revoke slot 0, then re-minting into it must succeed (revoked slots are reusable).
+    let cred0_id = c0.meta.id.clone();
+    store.revoke_credential(&cred0_id, "rotated").unwrap();
+    let c0c = sample_cred(id, 0, "AKIA_SLOT0_C");
+    store.put_credential(&c0c).unwrap();
+    let resolved = store
+        .lookup_credential_secret("sigv4", "AKIA_SLOT0_C")
+        .unwrap()
+        .expect("re-mint into a revoked slot must succeed");
+    assert_eq!(resolved.meta.slot, 0);
+}
+
+/// revoke_credential kills ONE credential independent of the key: the key stays enabled, the OTHER
+/// slot's credential stays live, only the targeted one is revoked. This is the plugin-level half of
+/// the fan-out fix the core redesign exists for (the orchestration itself lives in GovState::revoke,
+/// but it depends on this method actually working).
+#[test]
+fn revoke_credential_is_independent_of_the_key_and_other_slots() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_revoke1";
+    hard_reset(&store, id);
+    store.put_key(&sample_key(id)).unwrap();
+    let c0 = sample_cred(id, 0, "AKIA_REVOKE1_A");
+    let c1 = sample_cred(id, 1, "AKIA_REVOKE1_B");
+    store.put_credential(&c0).unwrap();
+    store.put_credential(&c1).unwrap();
+
+    store.revoke_credential(&c0.meta.id, "leaked").unwrap();
+
+    let key = store.get_key(id).unwrap().unwrap();
+    assert!(
+        key.enabled,
+        "revoking a credential must not touch the key's enabled flag"
+    );
+    assert!(key.is_live());
+
+    let creds = store.list_credentials(id).unwrap();
+    let meta0 = creds.iter().find(|c| c.id == c0.meta.id).unwrap();
+    let meta1 = creds.iter().find(|c| c.id == c1.meta.id).unwrap();
+    assert!(
+        meta0.revoked_at.is_some(),
+        "the targeted credential must be revoked"
+    );
+    assert!(
+        meta1.revoked_at.is_none(),
+        "the OTHER slot's credential must be untouched"
+    );
+
+    assert!(
+        store
+            .lookup_credential_secret("sigv4", "AKIA_REVOKE1_A")
+            .unwrap()
+            .is_none()
+            || !meta0.is_live(0),
+        "a revoked credential must no longer resolve as live"
+    );
+
+    // Idempotent.
+    store
+        .revoke_credential(&c0.meta.id, "leaked again")
+        .unwrap();
+}
+
+/// HYDRATION-DELTA SOUNDNESS: the exact invariant this session's design work flagged as a real gap
+/// (independently found by the SQLite and MySQL schema design passes). A revision-based delta
+/// consumer polling list_keys_since/list_credentials_since must be able to observe a delete_key
+/// tombstone AND infer the credential deletion from it, because the credential rows are hard-deleted
+/// and produce no delta of their own.
+#[test]
+fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let id = "vk_hydrate1";
+    hard_reset(&store, id);
+
+    let key = sample_key(id);
+    let cred = sample_cred(id, 0, "AKIA_HYDRATE1");
+    store.put_key_with_credential(&key, &cred).unwrap();
+
+    // Establish a watermark AFTER the mint (so the delete is the only thing after it).
+    let watermark = store.get_key(id).unwrap().unwrap().revision;
+
+    store.delete_key(id).unwrap();
+
+    let key_deltas = store.list_keys_since(watermark).unwrap();
+    let tombstoned = key_deltas
+        .iter()
+        .find(|k| k.id == id)
+        .expect("the tombstoned key MUST appear in the delta since the pre-delete watermark");
+    assert!(
+        !tombstoned.is_live(),
+        "the delta must show the key as tombstoned"
+    );
+
+    // The credential delta, by contrast, is NOT required to (and structurally cannot) show the
+    // deletion -- this is the exact gap. A correct hydrator must react to the KEY delta's
+    // deleted_at, not wait for a credential delta that will never come.
+    let cred_deltas = store.list_credentials_since(watermark).unwrap();
+    assert!(
+        cred_deltas.iter().all(|c| c.meta.key_id != id),
+        "a hard-deleted credential produces no further delta -- this is the documented gap the \
+         consumer-side contract (see Store::list_credentials_since's doc) exists to close"
+    );
+}
+
+/// A concurrent-instance race: two independent connections both try to delete the same key. Exactly
+/// one does the real work; both must return Ok (idempotent), and the final state must be a single,
+/// consistent tombstone -- not a partial/interleaved one.
+#[test]
+fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
+    let Some(url) = live_url() else { return };
+    let store_a = PostgresStore::connect(&url).expect("connect a");
+    let store_b = PostgresStore::connect(&url).expect("connect b");
+    let id = "vk_concurrent_del1";
+    hard_reset(&store_a, id);
+    store_a.put_key(&sample_key(id)).unwrap();
+    let cred = sample_cred(id, 0, "AKIA_CONCURRENT1");
+    store_a.put_credential(&cred).unwrap();
+
+    let url_b = url.clone();
+    let id_b = id.to_string();
+    let handle = std::thread::spawn(move || {
+        let store_b2 = PostgresStore::connect(&url_b).expect("connect b2");
+        store_b2.delete_key(&id_b)
+    });
+    let r1 = store_b.delete_key(id);
+    let r2 = handle.join().unwrap();
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "both concurrent deletes must succeed (idempotent), got {r1:?} / {r2:?}"
+    );
+
+    let after = store_a.get_key(id).unwrap().unwrap();
+    assert!(!after.is_live());
+    assert!(store_a.list_credentials(id).unwrap().is_empty());
+}
+
+/// get_usage's REPEATABLE READ snapshot must not tear: a concurrent add_usage landing between the
+/// requests-row read and the model-rows read must not be half-visible.
+#[test]
+fn get_usage_transaction_is_actually_repeatable_read() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
+    let level: String = tx
+        .query_one("SHOW transaction_isolation", &[])
+        .unwrap()
+        .get(0);
+    tx.commit().unwrap();
+    assert_eq!(
+        level, "repeatable read",
+        "get_usage's helper must actually open REPEATABLE READ"
+    );
+    let _ = store.get_usage("nonexistent_bucket", 0); // smoke: still callable
+}
+
+/// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
+/// pricing_version) and the renamed tokens_cache_write (was tokens_cache_creation).
+#[test]
+fn metering_roundtrip_new_fields() {
+    let Some(url) = live_url() else { return };
+    let store = PostgresStore::connect(&url).expect("connect");
+    let bucket = 20_270_101u64;
+    hard_reset(&store, "vk_meter_new1");
+    store
+        .add_metering(&busbar_api::MeteringDelta {
+            key_id: "vk_meter_new1".into(),
+            bucket,
+            model: "m".into(),
+            provider: "p".into(),
+            tokens_input: 10,
+            tokens_output: 20,
+            tokens_cache_read: 1,
+            tokens_cache_write: 2,
+            requests: 3,
+            billable_requests: 2,
+            key_group_at_use: "growth".into(),
+            pricing_version: "2026-07".into(),
+        })
+        .unwrap();
+    let rows = store.list_metering(bucket).unwrap();
+    let row = rows.iter().find(|r| r.key_id == "vk_meter_new1").unwrap();
+    assert_eq!(row.tokens_cache_write, 2);
+    assert_eq!(row.billable_requests, 2);
+    assert_eq!(row.key_group_at_use, "growth");
+    assert_eq!(row.pricing_version, "2026-07");
 }

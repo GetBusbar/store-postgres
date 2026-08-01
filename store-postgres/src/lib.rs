@@ -5,40 +5,42 @@
 //! plugin. Implements `busbar_api::Store` over a mutex-guarded synchronous `postgres` client,
 //! depending only on the `busbar-api` contract (plus the `postgres` driver), never on the engine.
 //!
-//! It mirrors the SQLite backend's schema and semantics exactly (same tables, same UPSERT shapes,
-//! same JSON encoding of `allowed_pools`) so `store: sqlite` and `store: postgres` are drop-in
-//! interchangeable — the only differences are the SQL dialect (`$N` params, `EXCLUDED`, `GREATEST`,
-//! `BIGINT`/`BOOLEAN`) and that Postgres is a shared server, which is the whole point: one database
-//! behind a fleet of busbar nodes means virtual keys, budgets, and usage are shared across the
-//! cluster instead of siloed per node.
+//! Schema v5 (1.5.0, the generic-credentials redesign): `virtual_keys`/`aws_credentials` are
+//! replaced by `keys` (pure principal attributes, `generation_hash` instead of `key_hash`,
+//! `expires_at`/`deleted_at`/`revision`) and `credentials` (kind-polymorphic row-looked-up
+//! credentials — today only `kind='sigv4'`). `DELETE` is a TOMBSTONE, not a hard delete: the `keys`
+//! row survives (so `usage_metering.key_id` keeps resolving forever) while every credential row for
+//! it is destroyed and `enabled`/`deleted_at` are set, atomically, in the same transaction and the
+//! same `revision` stamp — this is what makes revision-delta hydration observe the tombstone AND
+//! the credential disappearance as one atomic delta (see `delete_key`'s doc comment for why this
+//! matters: a naive implementation that tombstoned the key in one transaction and deleted
+//! credentials in another would let a `REPEATABLE READ` hydration snapshot land between them and
+//! observe a "deleted" key whose credential is still live).
 //!
-//! Like SQLite, it is a **single mutex-guarded connection** used off the request hot path (key CRUD
-//! + the write-behind usage flush), so serializing access on one connection is correct and simple.
-//!
-//! "Off the hot path" means off the **reactor**: the one request-triggered read that exists (the
-//! revocation denylist re-sync, at most once per node per staleness window) is SCHEDULED onto the
-//! blocking pool and bounded to one outstanding call — no request ever waits on this connection,
-//! and no Tokio worker thread is ever parked inside it. That property is load-bearing precisely
-//! because of the two limitations below: with neither a reconnect nor a statement timeout, a call
-//! into this client can block forever, so it must never block anything that has to keep running.
+//! Like the prior schema, this is a **single mutex-guarded connection** used off the request hot
+//! path (key CRUD + the write-behind usage flush) — governance is off the reactor entirely.
 //!
 //! ## Known limitations (documented honestly, not papered over)
 //!
 //! - **No TLS in this build (`NoTls`).** Run the connection over a trusted network segment, a local
-//!   socket, or a TLS-terminating proxy (pgbouncer/stunnel). The Redis store, by contrast, speaks
-//!   `rediss://` natively.
-//! - **No automatic reconnect.** A persistently dropped connection surfaces as store errors on the
-//!   (write-behind, retried-per-tick) flush path and on admin operations; the budget flusher
-//!   re-marks unflushed deltas dirty and retries every tick, so accrued spend is not lost across a
-//!   brief outage, but a permanently broken connection requires a process restart (let your
-//!   supervisor handle it). The Redis store implements one-shot transparent reconnect.
+//!   socket, or a TLS-terminating proxy (pgbouncer/stunnel).
+//! - **No automatic reconnect.** A persistently dropped connection surfaces as store errors; a
+//!   permanently broken connection requires a process restart.
+//! - **No partitioning, no LISTEN/NOTIFY-accelerated hydration, no column-level secret grants in
+//!   this pass.** The design session that produced this schema recommended all three as scale/perf
+//!   layers on top of this contract — deliberately deferred here in favor of getting the
+//!   correctness-critical surface (tombstone semantics, revoke fan-out via `revoke_credential`,
+//!   hydration-delta soundness, slot-safe credential minting) right first. None of the three change
+//!   the `Store` trait's observable behavior; they're purely internal to this crate and can be
+//!   added later without another schema bump.
 
 use busbar_api::{
-    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, ModelTokens, Store, StoreError,
-    StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
+    ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 use postgres::types::ToSql;
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, NoTls, Row, Transaction};
 use std::sync::Mutex;
 
 // postgres driver error -> the api's backend-agnostic `StoreError` (the contract crate stays
@@ -63,7 +65,6 @@ fn is_undefined_table(e: &postgres::Error) -> bool {
 /// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
 /// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
 fn dsn_password(dsn: &str) -> Option<String> {
-    // URL form: `scheme://[user[:pass]@]host...`.
     if let Some(rest) = dsn.split("://").nth(1) {
         if let Some((userinfo, _)) = rest.rsplit_once('@') {
             if let Some((_, pass)) = userinfo.split_once(':') {
@@ -73,7 +74,6 @@ fn dsn_password(dsn: &str) -> Option<String> {
             }
         }
     }
-    // libpq keyword form: whitespace-separated `key=value` pairs; find `password=...`.
     for tok in dsn.split_whitespace() {
         if let Some(v) = tok.strip_prefix("password=") {
             if !v.is_empty() {
@@ -122,51 +122,71 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version, mirrored from the SQLite backend's `PRAGMA user_version` in a tiny
-/// `busbar_schema` table. v2 (1.5.0 dev) = the token-ledger cost model; v3 = the 1.5.0 PURE-AUTH
-/// key shape (inline limit columns dropped, `budget_group` renamed `key_group`, `allowed_pools`
-/// nullable for the C6 NULL-vs-`'[]'` grant intent - see the SQLite backend's `SCHEMA_VERSION`
-/// doc). v4 = the usage ledger's REQUEST-COUNT SPLIT: `usage_windows` gains a `billable_requests`
-/// column (admitted minus non-2xx refunds - the fee base) alongside `requests` (the admission
-/// count). 1.5.0 is unreleased, so a pre-v4 database is dropped and recreated - a bump, never a
-/// migration.
-const SCHEMA_VERSION: i64 = 4;
+/// Store schema version. v5 (1.5.0 generic-credentials redesign): `virtual_keys`/`aws_credentials`
+/// -> `keys`/`credentials` (kind-polymorphic, slot-bounded, tombstone-delete, revision-stamped for
+/// incremental hydration). 1.5.0 is unreleased, so a pre-v5 database is dropped and recreated - a
+/// bump, never a migration.
+const SCHEMA_VERSION: i64 = 5;
 
-// Same tables/columns as the SQLite backend, in Postgres types: INTEGER -> BIGINT, the enabled flag
-// as BOOLEAN. `CREATE TABLE IF NOT EXISTS` is idempotent, so migrate() is safe to run every open.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
     version BIGINT PRIMARY KEY
 );
-CREATE TABLE IF NOT EXISTS virtual_keys (
-    id               TEXT PRIMARY KEY,
-    key_hash         TEXT NOT NULL UNIQUE,
-    name             TEXT NOT NULL,
-    -- NULLABLE JSON array (v3): NULL = the pool grant was OMITTED at mint = ALL pools; '[]' = an
-    -- explicit empty grant = NO pools (C6: the two must never collapse into each other).
-    allowed_pools    TEXT,
-    enabled          BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at       BIGINT NOT NULL,
-    -- The key's groups: binding (VirtualKey.group); key_group because GROUP is an SQL keyword.
-    key_group        TEXT,
-    labels           TEXT NOT NULL DEFAULT '{}'
+CREATE TABLE IF NOT EXISTS store_revision (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
 );
-CREATE TABLE IF NOT EXISTS aws_credentials (
-    access_key_id     TEXT PRIMARY KEY,
-    key_id            TEXT NOT NULL,
-    secret_access_key TEXT NOT NULL
+INSERT INTO store_revision (only_row, revision) VALUES (TRUE, 0) ON CONFLICT (only_row) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS keys (
+    id              TEXT PRIMARY KEY,
+    -- Rotation fingerprint (VirtualKey::generation_hash), NOT a lookup key -- deliberately no
+    -- UNIQUE constraint, see the type's own doc for why.
+    generation_hash TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    -- NULL = the pool grant was OMITTED at mint = ALL pools; a JSON array (possibly empty) = the
+    -- exhaustive grant (C6: NULL and '[]' must never collapse into each other).
+    allowed_pools   TEXT,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      BIGINT NOT NULL,
+    key_group       TEXT,
+    labels          TEXT NOT NULL DEFAULT '{}',
+    expires_at      BIGINT,
+    -- TOMBSTONE marker. NULL = live. The row is never removed once tombstoned; see delete_key.
+    deleted_at      BIGINT,
+    revision        BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT keys_tombstone_disabled CHECK (deleted_at IS NULL OR enabled = FALSE)
 );
-CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id);
--- The TOKEN LEDGER (v2): per-(bucket, window) request counts + per-(bucket, window, model) tier
--- token counts. `bucket_id` is a virtual key's id OR a budget-group bucket id. NO spend column:
--- dollars are derived at read time from `ledger x rate_card` in the engine.
+CREATE INDEX IF NOT EXISTS idx_keys_revision ON keys (revision);
+
+-- Row-looked-up credentials ONLY (today: sigv4). Bearer/signed-token auth is never represented
+-- here -- verify_token never looks up a row, it only compares VirtualKey::generation_hash. Slot
+-- bounds cardinality to exactly 2 rows per (key_id, kind), for safe overlap-window rotation.
+CREATE TABLE IF NOT EXISTS credentials (
+    id            TEXT PRIMARY KEY,
+    key_id        TEXT NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('sigv4')),
+    slot          SMALLINT NOT NULL CHECK (slot IN (0, 1)),
+    public_id     TEXT NOT NULL,
+    secret        TEXT,
+    secret_form   TEXT NOT NULL CHECK (secret_form IN ('none', 'recoverable', 'digest')),
+    created_at    BIGINT NOT NULL,
+    updated_at    BIGINT NOT NULL,
+    expires_at    BIGINT,
+    revoked_at    BIGINT,
+    revoke_reason TEXT,
+    revision      BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT credentials_public_id_uniq UNIQUE (kind, public_id),
+    CONSTRAINT credentials_slot_uniq UNIQUE (key_id, kind, slot),
+    CONSTRAINT credentials_secret_form_matches CHECK ((secret_form = 'none') = (secret IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_revision ON credentials (revision);
+CREATE INDEX IF NOT EXISTS idx_credentials_key_id ON credentials (key_id);
+
 CREATE TABLE IF NOT EXISTS usage_windows (
     bucket_id    TEXT NOT NULL,
     window_start BIGINT NOT NULL,
-    -- ADMISSION count (never refunded): the requests-LIMIT truth.
     requests     BIGINT NOT NULL DEFAULT 0,
-    -- v4: admitted MINUS non-2xx refunds - the FEE BASE for the 2xx-only charge. Persisted and
-    -- accumulated exactly like `requests`, just with its own signed delta.
     billable_requests BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start)
 );
@@ -181,20 +201,21 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
     PRIMARY KEY (bucket_id, window_start, model)
 );
 CREATE TABLE IF NOT EXISTS usage_metering (
-    key_id                TEXT NOT NULL,
-    bucket                BIGINT NOT NULL,
-    model                 TEXT NOT NULL,
-    provider              TEXT NOT NULL,
-    tokens_input          BIGINT NOT NULL DEFAULT 0,
-    tokens_output         BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_read     BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_creation BIGINT NOT NULL DEFAULT 0,
-    requests              BIGINT NOT NULL DEFAULT 0,
+    key_id             TEXT NOT NULL,
+    bucket             BIGINT NOT NULL,
+    model              TEXT NOT NULL,
+    provider           TEXT NOT NULL,
+    tokens_input       BIGINT NOT NULL DEFAULT 0,
+    tokens_output      BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_read  BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_write BIGINT NOT NULL DEFAULT 0,
+    requests           BIGINT NOT NULL DEFAULT 0,
+    billable_requests  BIGINT NOT NULL DEFAULT 0,
+    key_group_at_use   TEXT NOT NULL DEFAULT '',
+    pricing_version    TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (key_id, bucket, model, provider)
 );
--- The admin AUDIT log's durable home (mirrors the SQLite backend). Append-only; `seq` is the engine's
--- monotonic sequence (PK). The engine owns the hash chain; the store persists each record verbatim
--- (upsert on `seq` so a replay is idempotent) and returns them oldest-first for boot restore.
+CREATE INDEX IF NOT EXISTS idx_usage_metering_bucket ON usage_metering (bucket);
 CREATE TABLE IF NOT EXISTS audit_log (
     seq       BIGINT PRIMARY KEY,
     ts        BIGINT NOT NULL,
@@ -205,8 +226,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_hash TEXT NOT NULL,
     hash      TEXT NOT NULL
 );
--- The signed-token REVOCATION denylist (1.5.0), mirroring the SQLite backend: a stateless minted
--- token is revoked by recording its subject id here. `sub` is the PRIMARY KEY (idempotent add).
 CREATE TABLE IF NOT EXISTS denylist (
     sub        TEXT PRIMARY KEY,
     reason     TEXT NOT NULL DEFAULT '',
@@ -221,26 +240,22 @@ pub struct PostgresStore {
 }
 
 /// Clamp a `u64` into `i64` for a BIGINT column (a value above `i64::MAX` pins to `i64::MAX`, never
-/// wraps) — mirrors the SQLite backend.
+/// wraps).
 fn clamp(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 /// Read a signed BIGINT back as a `u64`, clamping a (corrupt / direct-DB) negative to 0 instead of
-/// wrapping via `as` — mirrors the SQLite backend's DI-3 posture.
+/// wrapping via `as`.
 fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
 impl PostgresStore {
-    /// Connect to Postgres with the given libpq connection string / URL (e.g.
-    /// `postgres://user:pass@host:5432/dbname`) and ensure the schema. TLS is not wired in this
-    /// build (`NoTls`); front the database with a TLS-terminating proxy or a local socket.
+    /// Connect to Postgres with the given libpq connection string / URL and ensure the schema. TLS
+    /// is not wired in this build (`NoTls`); front the database with a TLS-terminating proxy or a
+    /// local socket.
     pub fn connect(conn_str: &str) -> StoreResult<Self> {
-        // A connect error's string can embed the DSN (and thus the password). Scrub it before it
-        // leaves the crate, matching the Redis backend. Handles both the URL form
-        // (`postgres://user:pass@host/db`) and the libpq keyword form (`password=secret`), in raw and
-        // percent-decoded shapes.
         let secret = dsn_password(conn_str);
         let client = Client::connect(conn_str, NoTls)
             .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
@@ -251,33 +266,28 @@ impl PostgresStore {
         Ok(store)
     }
 
-    /// Poison-recovering lock of the client (mirrors the SQLite backend): the guard is reachable off
-    /// the hot path, and continuing after a recovered guard is safe because the driver rolls back a
-    /// panicked statement.
     fn lock(&self) -> std::sync::MutexGuard<'_, Client> {
         self.client.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A fixed, arbitrary-but-stable `pg_advisory_lock` key scoping every `migrate()` call across
-    /// every process/connection that ever opens this crate's schema. See `migrate()`'s doc comment
-    /// for why this exists.
-    const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p", picked for stability/legibility only
+    /// Open a transaction that gives every statement inside it ONE consistent snapshot, taken at the
+    /// transaction's first statement — REPEATABLE READ, not the default READ COMMITTED (which gives
+    /// each statement its own fresh snapshot, a torn-read hazard for any multi-statement read like
+    /// `get_usage` or the hydration delta queries).
+    pub(crate) fn snapshot_consistent_tx<'a>(
+        client: &'a mut Client,
+    ) -> StoreResult<postgres::Transaction<'a>> {
+        client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .store()
+    }
+
+    const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p"
 
     fn migrate(&self) -> StoreResult<()> {
         let mut client = self.lock();
-        // CONCURRENCY (session-level advisory lock): `CREATE TABLE IF NOT EXISTS` is idempotent
-        // PER STATEMENT but NOT atomic under CONCURRENT DDL - two sessions can both see a table as
-        // "missing" and both attempt to create it; one loses a race on the table's implicit row
-        // type and fails with "duplicate key value violates unique constraint
-        // pg_type_typname_nsp_index" rather than a clean no-op. This is routine here: multiple
-        // independent processes (this crate's own live-DB unit test AND the plugin adapter's
-        // dlopen e2e test, run concurrently by `cargo test --workspace`, or simply two nodes
-        // booting against a fresh database at once in production) can all call `connect()` ->
-        // `migrate()` against the SAME database at the SAME time. `pg_advisory_lock` makes the
-        // whole migrate body single-flight across every concurrent connection: the first caller
-        // performs the CREATEs, every other caller blocks here until it's done and then finds the
-        // schema already at its target version (a cheap, correct no-op). Released in every exit
-        // path below, including error paths, so a failed migrate never wedges other connections.
         client
             .batch_execute(&format!(
                 "SELECT pg_advisory_lock({})",
@@ -285,7 +295,6 @@ impl PostgresStore {
             ))
             .store()?;
         let result = Self::migrate_locked(&mut client);
-        // Always release, even on error - never leave the lock held because migrate_locked bailed.
         let _ = client.batch_execute(&format!(
             "SELECT pg_advisory_unlock({})",
             Self::MIGRATE_LOCK_KEY
@@ -293,50 +302,41 @@ impl PostgresStore {
         result
     }
 
-    /// The actual migration body, run while holding `MIGRATE_LOCK_KEY` (see `migrate()`).
     fn migrate_locked(client: &mut Client) -> StoreResult<()> {
-        // SCHEMA-VERSION BUMP (v4, the 1.5.0 billable-requests ledger split; see SCHEMA_VERSION). A
-        // pre-v4 database - one that still carries the legacy `usage_counters` table, or a
-        // `virtual_keys` with the old inline-limit columns, or a `usage_windows` without
-        // `billable_requests` - is DROPPED and recreated (1.5.0 is unreleased: bump, not migrate). A
-        // fresh or already-v4 database passes straight through the idempotent CREATEs.
-        //
-        // H1 (data-loss): the version read must never CONFLATE a transient read error with a fresh
-        // DB. We ensure the version table exists FIRST, then read; a *transient* read failure
-        // (connection blip, lock timeout, permission) PROPAGATES and fails boot rather than
-        // defaulting to 0 and dropping every governance table on a healthy v2 DB. Only a genuine
-        // "relation does not exist" (SQLSTATE 42P01) counts as an unversioned (version 0) database.
         client
             .batch_execute("CREATE TABLE IF NOT EXISTS busbar_schema (version BIGINT PRIMARY KEY)")
             .store()?;
         let version: i64 =
             match client.query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[]) {
                 Ok(Some(r)) => r.get(0),
-                // No rows -> an empty (freshly created) version table -> version 0.
                 Ok(None) => 0,
-                // A genuinely-absent table is the only non-fatal "unversioned" signal (version 0). Any
-                // OTHER error (transient/connection/permission) MUST fail boot - never silently 0.
                 Err(e) if is_undefined_table(&e) => 0,
                 Err(e) => return Err(StoreError(e.to_string())),
             };
-        // Wrap the legacy DROP + full CREATE + version-INSERT in ONE transaction so a crash between
-        // the drop and the recreate cannot leave a half-initialised DB that a re-run re-drops (L3).
         let mut tx = client.transaction().store()?;
         if version < SCHEMA_VERSION {
             let legacy: bool = tx
-                .query_one("SELECT to_regclass('usage_counters') IS NOT NULL OR to_regclass('virtual_keys') IS NOT NULL", &[])
+                .query_one(
+                    "SELECT to_regclass('usage_counters') IS NOT NULL
+                        OR to_regclass('virtual_keys') IS NOT NULL
+                        OR to_regclass('aws_credentials') IS NOT NULL",
+                    &[],
+                )
                 .store()?
                 .get(0);
             if legacy {
                 tx.batch_execute(
                     "DROP TABLE IF EXISTS virtual_keys;
-                         DROP TABLE IF EXISTS aws_credentials;
-                         DROP TABLE IF EXISTS usage_counters;
-                         DROP TABLE IF EXISTS usage_windows;
-                         DROP TABLE IF EXISTS usage_ledger;
-                         DROP TABLE IF EXISTS usage_metering;
-                         DROP TABLE IF EXISTS audit_log;
-                         DROP TABLE IF EXISTS denylist;",
+                     DROP TABLE IF EXISTS aws_credentials;
+                     DROP TABLE IF EXISTS keys CASCADE;
+                     DROP TABLE IF EXISTS credentials;
+                     DROP TABLE IF EXISTS usage_counters;
+                     DROP TABLE IF EXISTS usage_windows;
+                     DROP TABLE IF EXISTS usage_ledger;
+                     DROP TABLE IF EXISTS usage_metering;
+                     DROP TABLE IF EXISTS audit_log;
+                     DROP TABLE IF EXISTS denylist;
+                     DROP TABLE IF EXISTS store_revision;",
                 )
                 .store()?;
             }
@@ -350,9 +350,24 @@ impl PostgresStore {
         tx.commit().store()?;
         Ok(())
     }
+
+    /// Bump and return the store-global revision INSIDE the caller's already-open transaction. Must
+    /// be the FIRST statement of any transaction that mutates `keys`/`credentials`/`denylist` (not
+    /// `denylist` directly — `add_denylist` doesn't take a revision param on the trait — but keys
+    /// and credentials do): calling it first fixes a single lock-acquisition order
+    /// (`store_revision` row, then whatever else the transaction touches) across every mutating
+    /// method, which is what makes cross-method deadlock structurally impossible.
+    fn next_revision(tx: &mut Transaction<'_>) -> StoreResult<i64> {
+        tx.query_one(
+            "UPDATE store_revision SET revision = revision + 1 WHERE only_row RETURNING revision",
+            &[],
+        )
+        .store()?
+        .try_get(0)
+        .store()
+    }
 }
 
-// `labels` encoding - identical to the SQLite backend: a JSON object in the `labels TEXT` column.
 fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
     serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
 }
@@ -360,93 +375,210 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-// `allowed_pools` encoding - identical to the SQLite backend (v3): SQL NULL = the grant was
-// OMITTED (ALL pools); a JSON array = the exhaustive grant, including the explicit empty grant
-// (NO pools). A malformed direct-DB value reads as the EMPTY grant (fail-restrictive, never a
-// silent widen to "all pools").
-fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
-    pools
-        .as_ref()
-        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
+// Wire/DB storage format is unchanged by the ScopeRef generalization -- still a plain JSON array
+// of bare pool-name strings (or NULL) in the `allowed_pools` TEXT column. Only the Rust-side type
+// at this crate's boundary changed (`Vec<String>` -> `Vec<ScopeRef>`); the conversion happens here,
+// at construction (`ScopeRef::pool(name)`) and at read (`.value`).
+fn pools_to_storage(pools: &Option<Vec<ScopeRef>>) -> Option<String> {
+    pools.as_ref().map(|p| {
+        let names: Vec<&str> = p.iter().map(|s| s.value.as_str()).collect();
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+    })
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
     let stored = stored?;
-    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
+    Some(
+        serde_json::from_str::<Vec<String>>(stored.trim())
+            .unwrap_or_default()
+            .into_iter()
+            .map(ScopeRef::pool)
+            .collect(),
+    )
 }
 
-/// Map a `virtual_keys` row (in the fixed SELECT column order) to a `VirtualKey`.
 fn row_to_key(r: &Row) -> VirtualKey {
     VirtualKey {
         id: r.get(0),
-        key_hash: r.get(1),
+        generation_hash: r.get(1),
         name: r.get(2),
-        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)),
+        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)),
         enabled: r.get(4),
         created_at: read_u64(r.get::<_, i64>(5)),
         group: r.get(6),
         labels: labels_from_storage(&r.get::<_, String>(7)),
+        expires_at: r.get::<_, Option<i64>>(8).map(read_u64),
+        deleted_at: r.get::<_, Option<i64>>(9).map(read_u64),
+        revision: read_u64(r.get::<_, i64>(10)),
     }
 }
 
-const KEY_COLUMNS: &str = "id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels";
+const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision";
+
+fn secret_form_to_storage(f: SecretForm) -> &'static str {
+    match f {
+        SecretForm::None => "none",
+        SecretForm::Recoverable => "recoverable",
+        SecretForm::Digest => "digest",
+    }
+}
+fn secret_form_from_storage(s: &str) -> SecretForm {
+    match s {
+        "recoverable" => SecretForm::Recoverable,
+        "digest" => SecretForm::Digest,
+        _ => SecretForm::None,
+    }
+}
+
+const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
+
+fn row_to_cred_meta(r: &Row) -> CredentialMeta {
+    CredentialMeta {
+        id: r.get(0),
+        key_id: r.get(1),
+        kind: r.get(2),
+        slot: r.get::<_, i16>(3) as u8,
+        public_id: r.get(4),
+        secret_form: secret_form_from_storage(r.get::<_, &str>(5)),
+        created_at: read_u64(r.get::<_, i64>(6)),
+        updated_at: read_u64(r.get::<_, i64>(7)),
+        expires_at: r.get::<_, Option<i64>>(8).map(read_u64),
+        revoked_at: r.get::<_, Option<i64>>(9).map(read_u64),
+        revoke_reason: r.get(10),
+        revision: read_u64(r.get::<_, i64>(11)),
+    }
+}
 
 impl Store for PostgresStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let pools = pools_to_storage(&key.allowed_pools);
+        let pools = pools_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
-        self.lock()
-            .execute(
-                "INSERT INTO virtual_keys
-                    (id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (id) DO UPDATE SET
-                    key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
-                    enabled=EXCLUDED.enabled, key_group=EXCLUDED.key_group, labels=EXCLUDED.labels",
-                &[
-                    &key.id, &key.key_hash, &key.name, &pools, &key.enabled, &created, &key.group,
-                    &labels,
-                ],
-            )
-            .store()?;
+        let expires = key.expires_at.map(clamp);
+        let deleted = key.deleted_at.map(clamp);
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let rev = Self::next_revision(&mut tx)?;
+        tx.execute(
+            "INSERT INTO keys
+                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             ON CONFLICT (id) DO UPDATE SET
+                generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
+                allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
+                key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
+                expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
+                revision=EXCLUDED.revision",
+            &[
+                &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
+                &key.group, &labels, &expires, &deleted, &rev,
+            ],
+        )
+        .store()?;
+        tx.commit().store()?;
         Ok(())
     }
 
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
-        let sql = format!("SELECT {KEY_COLUMNS} FROM virtual_keys WHERE id=$1");
+        let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE id=$1");
         let row = self.lock().query_opt(&sql, &[&id]).store()?;
         Ok(row.map(|r| row_to_key(&r)))
     }
 
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
-        let sql = format!("SELECT {KEY_COLUMNS} FROM virtual_keys ORDER BY created_at");
+        // Deliberately UNFILTERED (tombstoned rows included) -- see the trait doc: this serves both
+        // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
+        // default fallback, which needs tombstones visible to drive credential eviction downstream.
+        let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at");
         let rows = self.lock().query(&sql, &[]).store()?;
         Ok(rows.iter().map(row_to_key).collect())
     }
 
+    fn list_keys_since(&self, since: u64) -> StoreResult<Vec<VirtualKey>> {
+        let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 ORDER BY revision");
+        let rows = self.lock().query(&sql, &[&clamp(since)]).store()?;
+        Ok(rows.iter().map(row_to_key).collect())
+    }
+
     fn delete_key(&self, id: &str) -> StoreResult<()> {
-        // Atomic: the key row, its usage counters, and its AWS credentials go together or not at all,
-        // so a revoked key can never leave an orphaned credential (an auth-bypass) or stale usage.
+        // TOMBSTONE, not a hard delete: the `keys` row survives (billing/audit attribution keeps
+        // resolving it forever) while every credential row for it is destroyed. Both happen in ONE
+        // transaction stamped with the SAME revision, which is the load-bearing property for
+        // hydration soundness: a REPEATABLE READ hydration snapshot can never observe the
+        // tombstoned key without the credentials already being gone, so a delta-consumer that
+        // reacts to "this key's revision-delta shows deleted_at newly set" by evicting all its
+        // cached credentials is provably correct -- there is no window where the credential rows'
+        // own (now-nonexistent) deltas would have been needed to convey the deletion.
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
-        tx.execute("DELETE FROM virtual_keys WHERE id=$1", &[&id])
+        let already_deleted: Option<bool> = tx
+            .query_opt(
+                "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
+                &[&id],
+            )
+            .store()?
+            .map(|r| r.get(0));
+        match already_deleted {
+            None => {
+                // Unknown id: idempotent no-op per the trait doc (delete_key is defined idempotent;
+                // an unknown id is not distinguished from an already-tombstoned one at this layer).
+                tx.commit().store()?;
+                return Ok(());
+            }
+            Some(true) => {
+                // Already tombstoned: no-op, not an error.
+                tx.commit().store()?;
+                return Ok(());
+            }
+            Some(false) => {}
+        }
+        let rev = Self::next_revision(&mut tx)?;
+        tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
             .store()?;
-        tx.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id])
-            .store()?;
-        tx.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id])
-            .store()?;
-        tx.execute("DELETE FROM aws_credentials WHERE key_id=$1", &[&id])
-            .store()?;
+        tx.execute(
+            "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 WHERE id=$1",
+            &[&id, &rev, &rev],
+        )
+        .store()?;
+        tx.commit().store()?;
+        Ok(())
+    }
+
+    fn scrub_key(&self, id: &str) -> StoreResult<()> {
+        // PII-erasure only: null name/labels on an ALREADY-tombstoned key. Errors if unknown or
+        // still live -- scrubbing a live key would be silent, un-auditable data loss on an active
+        // principal (the trait doc's own guard: go through delete_key first).
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let deleted: Option<bool> = tx
+            .query_opt(
+                "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
+                &[&id],
+            )
+            .store()?
+            .map(|r| r.get(0));
+        match deleted {
+            None => return Err(StoreError(format!("scrub_key: unknown key {id}"))),
+            Some(false) => {
+                return Err(StoreError(format!(
+                    "scrub_key: key {id} is not tombstoned -- call delete_key first"
+                )))
+            }
+            Some(true) => {}
+        }
+        let rev = Self::next_revision(&mut tx)?;
+        tx.execute(
+            "UPDATE keys SET name='', labels='{}', revision=$2 WHERE id=$1",
+            &[&id, &rev],
+        )
+        .store()?;
         tx.commit().store()?;
         Ok(())
     }
 
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
-        // Read the requests row + every model row inside ONE transaction so a concurrent node's
-        // `add_usage` can never yield a torn ledger.
         let ws = clamp(window_start);
         let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
         let (requests, billable_requests): (u64, u64) = tx
             .query_opt(
                 "SELECT requests, billable_requests
@@ -488,9 +620,6 @@ impl Store for PostgresStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        // ABSOLUTE overwrite (memory is authoritative): replace the whole (bucket, window) record -
-        // the requests row AND every model row - in ONE transaction, so a re-flush is idempotent
-        // and a reader never sees half a ledger.
         let ws = clamp(window_start);
         let rq = clamp(ledger.requests);
         let brq = clamp(ledger.billable_requests);
@@ -510,38 +639,57 @@ impl Store for PostgresStore {
             &[&bucket_id, &ws, &rq, &brq],
         )
         .store()?;
-        for m in &ledger.models {
-            let (ti, to, tcr, tcw) = (
-                clamp(m.tokens.input),
-                clamp(m.tokens.output),
-                clamp(m.tokens.cache_read),
-                clamp(m.tokens.cache_write),
+        if !ledger.models.is_empty() {
+            let rows: Vec<(i64, i64, i64, i64)> = ledger
+                .models
+                .iter()
+                .map(|m| {
+                    (
+                        clamp(m.tokens.input),
+                        clamp(m.tokens.output),
+                        clamp(m.tokens.cache_read),
+                        clamp(m.tokens.cache_write),
+                    )
+                })
+                .collect();
+            let mut sql = String::from(
+                "INSERT INTO usage_ledger \
+                 (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
+                 VALUES ",
             );
-            tx.execute(
-                "INSERT INTO usage_ledger
-                    (bucket_id, window_start, model,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
-                &[&bucket_id, &ws, &m.model, &ti, &to, &tcr, &tcw],
-            )
-            .store()?;
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + rows.len() * 5);
+            params.push(&bucket_id);
+            params.push(&ws);
+            for (i, (m, row)) in ledger.models.iter().zip(rows.iter()).enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = 3 + i * 5;
+                sql.push_str(&format!(
+                    "($1,$2,${},${},${},${},${})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4
+                ));
+                params.push(&m.model);
+                params.push(&row.0);
+                params.push(&row.1);
+                params.push(&row.2);
+                params.push(&row.3);
+            }
+            tx.execute(&sql, &params).store()?;
         }
         tx.commit().store()?;
         Ok(())
     }
 
     fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
-        // ADDITIVE fleet-honest accumulate: the signed requests delta plus every per-model tier
-        // delta land in ONE transaction, each counter floored at 0 (GREATEST). N nodes flushing
-        // deltas sum to the true fleet total, where `put_usage`'s absolute overwrite is
-        // last-writer-wins. No dollar delta crosses this wire.
         let ws = clamp(window_start);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         tx.execute(
-            // `$N::bigint` casts anchor the parameter type inside GREATEST (whose bare `0` would
-            // otherwise make Postgres infer int4 and fail to serialize the i64 binding). The
-            // `billable_requests` axis accumulates exactly like `requests`, floored at 0.
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
              VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
@@ -578,27 +726,31 @@ impl Store for PostgresStore {
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
-        let (bucket, ti, to, tcr, tcc) = (
+        let (bucket, ti, to, tcr, tcw) = (
             clamp(d.bucket),
             clamp(d.tokens_input),
             clamp(d.tokens_output),
             clamp(d.tokens_cache_read),
-            clamp(d.tokens_cache_creation),
+            clamp(d.tokens_cache_write),
         );
         let requests = clamp(d.requests);
+        let brequests = clamp(d.billable_requests);
         self.lock()
             .execute(
                 "INSERT INTO usage_metering (key_id, bucket, model, provider,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                     requests, billable_requests, key_group_at_use, pricing_version)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                  ON CONFLICT (key_id, bucket, model, provider) DO UPDATE SET
-                     tokens_input          = usage_metering.tokens_input + EXCLUDED.tokens_input,
-                     tokens_output         = usage_metering.tokens_output + EXCLUDED.tokens_output,
-                     tokens_cache_read     = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
-                     tokens_cache_creation = usage_metering.tokens_cache_creation + EXCLUDED.tokens_cache_creation,
-                     requests              = usage_metering.requests + EXCLUDED.requests",
+                     tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
+                     tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
+                     tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
+                     tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
+                     requests           = usage_metering.requests + EXCLUDED.requests,
+                     billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
                 &[
-                    &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcc, &requests,
+                    &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
+                    &brequests, &d.key_group_at_use, &d.pricing_version,
                 ],
             )
             .store()?;
@@ -611,7 +763,8 @@ impl Store for PostgresStore {
             .lock()
             .query(
                 "SELECT key_id, model, provider,
-                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                    requests, billable_requests, key_group_at_use, pricing_version
                  FROM usage_metering WHERE bucket=$1",
                 &[&b],
             )
@@ -625,82 +778,151 @@ impl Store for PostgresStore {
                 tokens_input: read_u64(r.get::<_, i64>(3)),
                 tokens_output: read_u64(r.get::<_, i64>(4)),
                 tokens_cache_read: read_u64(r.get::<_, i64>(5)),
-                tokens_cache_creation: read_u64(r.get::<_, i64>(6)),
+                tokens_cache_write: read_u64(r.get::<_, i64>(6)),
                 requests: read_u64(r.get::<_, i64>(7)),
+                billable_requests: read_u64(r.get::<_, i64>(8)),
+                key_group_at_use: r.get(9),
+                pricing_version: r.get(10),
             })
             .collect())
     }
 
-    fn put_aws_credential(&self, cred: &AwsCredential) -> StoreResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO aws_credentials (access_key_id, key_id, secret_access_key)
-                 VALUES ($1,$2,$3)
-                 ON CONFLICT (access_key_id) DO UPDATE SET
-                    key_id=EXCLUDED.key_id, secret_access_key=EXCLUDED.secret_access_key",
-                &[&cred.access_key_id, &cred.key_id, &cred.secret_access_key],
-            )
+    fn purge_windows_before(&self, before: u64) -> StoreResult<u64> {
+        let b = clamp(before);
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let n1 = tx
+            .execute("DELETE FROM usage_windows WHERE window_start < $1", &[&b])
             .store()?;
+        tx.execute("DELETE FROM usage_ledger WHERE window_start < $1", &[&b])
+            .store()?;
+        tx.commit().store()?;
+        Ok(n1)
+    }
+
+    fn purge_metering_before(&self, bucket: &str) -> StoreResult<u64> {
+        // The trait's purge_metering_before takes `bucket: &str` while list_metering/add_metering
+        // use `bucket: u64` -- an inconsistency in the core trait itself, not introduced here.
+        // usage_metering.bucket is genuinely BIGINT, so this parses the string form.
+        let b: i64 = bucket.parse().map_err(|_| {
+            StoreError(format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            ))
+        })?;
+        let n = self
+            .lock()
+            .execute("DELETE FROM usage_metering WHERE bucket=$1", &[&b])
+            .store()?;
+        Ok(n)
+    }
+
+    fn put_credential(&self, secret: &CredentialSecret) -> StoreResult<()> {
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        Self::put_credential_tx(&mut tx, secret)?;
+        tx.commit().store()?;
         Ok(())
     }
 
-    fn put_key_with_aws_credential(
+    fn put_key_with_credential(
         &self,
         key: &VirtualKey,
-        cred: &AwsCredential,
+        secret: &CredentialSecret,
     ) -> StoreResult<()> {
-        // ATOMIC mint: the bearer key and its AWS credential commit together or not at all.
-        let pools = pools_to_storage(&key.allowed_pools);
+        // ATOMIC mint: the bearer key and its credential commit together or not at all.
+        let pools = pools_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
+        let expires = key.expires_at.map(clamp);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
+        let rev = Self::next_revision(&mut tx)?;
         tx.execute(
-            "INSERT INTO virtual_keys
-                (id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            "INSERT INTO keys
+                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10)
              ON CONFLICT (id) DO UPDATE SET
-                key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
-                enabled=EXCLUDED.enabled, key_group=EXCLUDED.key_group, labels=EXCLUDED.labels",
+                generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
+                allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
+                key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
+                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision",
             &[
-                &key.id, &key.key_hash, &key.name, &pools, &key.enabled, &created, &key.group,
-                &labels,
+                &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
+                &key.group, &labels, &expires, &rev,
             ],
         )
         .store()?;
+        Self::put_credential_tx(&mut tx, secret)?;
+        tx.commit().store()?;
+        Ok(())
+    }
+
+    fn list_credentials(&self, key_id: &str) -> StoreResult<Vec<CredentialMeta>> {
+        let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
+        let rows = self.lock().query(&sql, &[&key_id]).store()?;
+        Ok(rows.iter().map(row_to_cred_meta).collect())
+    }
+
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> StoreResult<Option<CredentialSecret>> {
+        let sql = format!(
+            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE kind=$1 AND public_id=$2"
+        );
+        let row = self.lock().query_opt(&sql, &[&kind, &public_id]).store()?;
+        Ok(row.map(|r| CredentialSecret {
+            meta: row_to_cred_meta(&r),
+            secret: r.get::<_, Option<String>>(12).unwrap_or_default(),
+        }))
+    }
+
+    fn revoke_credential(&self, id: &str, reason: &str) -> StoreResult<()> {
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let exists: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=$1)",
+                &[&id],
+            )
+            .store()?
+            .get(0);
+        if !exists {
+            // Idempotent per the trait doc.
+            tx.commit().store()?;
+            return Ok(());
+        }
+        let rev = Self::next_revision(&mut tx)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         tx.execute(
-            "INSERT INTO aws_credentials (access_key_id, key_id, secret_access_key)
-             VALUES ($1,$2,$3)
-             ON CONFLICT (access_key_id) DO UPDATE SET
-                key_id=EXCLUDED.key_id, secret_access_key=EXCLUDED.secret_access_key",
-            &[&cred.access_key_id, &cred.key_id, &cred.secret_access_key],
+            "UPDATE credentials SET revoked_at=COALESCE(revoked_at,$2), revoke_reason=$3, updated_at=$2, revision=$4
+             WHERE id=$1",
+            &[&id, &clamp(now), &reason, &rev],
         )
         .store()?;
         tx.commit().store()?;
         Ok(())
     }
 
-    fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
-        let rows = self
-            .lock()
-            .query(
-                "SELECT access_key_id, key_id, secret_access_key FROM aws_credentials",
-                &[],
-            )
-            .store()?;
+    fn list_credentials_since(&self, since: u64) -> StoreResult<Vec<CredentialSecret>> {
+        let sql = format!(
+            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 ORDER BY revision"
+        );
+        let rows = self.lock().query(&sql, &[&clamp(since)]).store()?;
         Ok(rows
             .iter()
-            .map(|r| AwsCredential {
-                access_key_id: r.get(0),
-                key_id: r.get(1),
-                secret_access_key: r.get(2),
+            .map(|r| CredentialSecret {
+                meta: row_to_cred_meta(r),
+                secret: r.get::<_, Option<String>>(12).unwrap_or_default(),
             })
             .collect())
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
-        // Upsert on the `seq` PK: append-only in practice, idempotent if the engine re-writes a record
-        // for the same seq (never a UNIQUE violation).
         let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
         self.lock()
             .execute(
@@ -735,27 +957,10 @@ impl Store for PostgresStore {
                 &[],
             )
             .store()?;
-        Ok(rows
-            .iter()
-            .map(|r| AuditRecord {
-                seq: read_u64(r.get::<_, i64>(0)),
-                ts: read_u64(r.get::<_, i64>(1)),
-                action: r.get(2),
-                resource: r.get(3),
-                outcome: r.get(4),
-                principal: r.get(5),
-                prev_hash: r.get(6),
-                hash: r.get(7),
-            })
-            .collect())
+        Ok(rows.iter().map(row_to_audit).collect())
     }
 
     fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
-        // BOUNDED restore read: select only the most-recent `limit` rows at the SOURCE (a `LIMIT` on
-        // a descending scan), then reverse into oldest-first. Without this override the trait default
-        // materializes the ENTIRE (never-pruned) durable audit log before truncating in memory, which
-        // over the plugin ABI can exceed the response cap or OOM on a large log. Mirrors the SQLite
-        // backend's `LIMIT`ed tail query.
         let rows = self
             .lock()
             .query(
@@ -764,26 +969,12 @@ impl Store for PostgresStore {
                 &[&i64::try_from(limit).unwrap_or(i64::MAX)],
             )
             .store()?;
-        let mut out: Vec<AuditRecord> = rows
-            .iter()
-            .map(|r| AuditRecord {
-                seq: read_u64(r.get::<_, i64>(0)),
-                ts: read_u64(r.get::<_, i64>(1)),
-                action: r.get(2),
-                resource: r.get(3),
-                outcome: r.get(4),
-                principal: r.get(5),
-                prev_hash: r.get(6),
-                hash: r.get(7),
-            })
-            .collect();
-        out.reverse(); // DESC LIMIT gave newest-first; the restore contract is oldest-first.
+        let mut out: Vec<AuditRecord> = rows.iter().map(row_to_audit).collect();
+        out.reverse();
         Ok(out)
     }
 
     fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
-        // Idempotent revoke (mirrors the SQLite backend): the subject stays denied exactly once; a
-        // repeat refreshes the operator reason.
         self.lock()
             .execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, 0)
@@ -800,8 +991,89 @@ impl Store for PostgresStore {
     }
 }
 
-// A tiny compile-time assertion that the param binding types line up (keeps ToSql import used even
-// when the integration test is skipped for lack of a live database).
+fn row_to_audit(r: &Row) -> AuditRecord {
+    AuditRecord {
+        seq: read_u64(r.get::<_, i64>(0)),
+        ts: read_u64(r.get::<_, i64>(1)),
+        action: r.get(2),
+        resource: r.get(3),
+        outcome: r.get(4),
+        principal: r.get(5),
+        prev_hash: r.get(6),
+        hash: r.get(7),
+    }
+}
+
+impl PostgresStore {
+    /// Shared body of `put_credential`/`put_key_with_credential`: upsert on `(key_id, kind, slot)`.
+    /// Minting into an OCCUPIED LIVE slot (revoked_at IS NULL) MUST fail rather than silently
+    /// destroy a working credential mid-overlap-window -- the `WHERE credentials.revoked_at IS NOT
+    /// NULL` guard on the `DO UPDATE` makes that structural: the upsert simply does not apply if
+    /// the existing row is live, and the subsequent `changed` check turns that into a real error
+    /// instead of a silent no-op.
+    fn put_credential_tx(tx: &mut Transaction<'_>, secret: &CredentialSecret) -> StoreResult<()> {
+        let m = &secret.meta;
+        let rev = Self::next_revision(tx)?;
+        let form = secret_form_to_storage(m.secret_form);
+        let secret_val = if m.secret_form == SecretForm::None {
+            None
+        } else {
+            Some(secret.secret.as_str())
+        };
+        let expires = m.expires_at.map(clamp);
+        let changed = tx
+            .execute(
+                "INSERT INTO credentials
+                    (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,NULL,NULL,$10)
+                 ON CONFLICT (key_id, kind, slot) DO UPDATE SET
+                    id=EXCLUDED.id, public_id=EXCLUDED.public_id, secret=EXCLUDED.secret,
+                    secret_form=EXCLUDED.secret_form, updated_at=EXCLUDED.updated_at,
+                    expires_at=EXCLUDED.expires_at, revoked_at=NULL, revoke_reason=NULL,
+                    revision=EXCLUDED.revision
+                 WHERE credentials.revoked_at IS NOT NULL",
+                &[
+                    &m.id,
+                    &m.key_id,
+                    &m.kind,
+                    &(m.slot as i16),
+                    &m.public_id,
+                    &secret_val,
+                    &form,
+                    &clamp(m.created_at),
+                    &expires,
+                    &rev,
+                ],
+            )
+            .store()?;
+        if changed == 0 {
+            // Either the slot is occupied by a LIVE credential (the WHERE guard blocked it), or this
+            // is a genuine first insert into a free slot that the ON CONFLICT branch didn't need --
+            // distinguish by checking existence.
+            let exists: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=$1 AND kind=$2 AND slot=$3)",
+                    &[&m.key_id, &m.kind, &(m.slot as i16)],
+                )
+                .store()?
+                .get(0);
+            if exists {
+                return Err(StoreError(format!(
+                    "put_credential: slot {} for key {} kind {} holds a LIVE credential; revoke it first",
+                    m.slot, m.key_id, m.kind
+                )));
+            }
+            // Free slot, first insert -- the INSERT branch of the upsert should have applied. If we
+            // get here with changed==0 and no existing row, something else rejected the write (e.g.
+            // a UNIQUE(kind, public_id) violation on a DIFFERENT key/slot) -- surface plainly.
+            return Err(StoreError(
+                "put_credential: insert did not apply (public_id may already be in use by another credential)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const _: fn() = || {
     fn assert_tosql<T: ToSql>() {}
     assert_tosql::<i64>();
