@@ -126,7 +126,22 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// -> `keys`/`credentials` (kind-polymorphic, slot-bounded, tombstone-delete, revision-stamped for
 /// incremental hydration). 1.5.0 is unreleased, so a pre-v5 database is dropped and recreated - a
 /// bump, never a migration.
-const SCHEMA_VERSION: i64 = 5;
+///
+/// v6: ONE-TIME, DURABLE backfill of `usage_windows.billable_requests` for any row still shaped
+/// `billable_requests=0, requests>0` at the moment this migration runs. Exists to retire a bug in
+/// busbarAI core's `governance::state::hydrate_budgets`, which used to infer "legacy pre-split
+/// row" from that exact counter shape at EVERY boot - but a fully-refunded window (every request
+/// in it non-2xx; `refund_bucket` decrements `billable_requests` but deliberately never
+/// `requests`) produces the identical shape, so hydrate_budgets could not tell "never migrated"
+/// from "correctly refunded to zero" and silently re-billed refunded fees on restart. Doing the
+/// value-based backfill HERE, ONCE, gated on the version crossing, is safe ONLY because 1.5.0 has
+/// never shipped to a real customer - there is no genuine "currently, legitimately refunded to
+/// zero" row in existence anywhere to accidentally re-bill at the moment this migration ships.
+/// This would NOT be safe to run again, or to run as a per-boot heuristic (that was the bug) -
+/// which is exactly why it is gated on `version < 6` and will never fire a second time on any
+/// store that has already crossed into v6. `hydrate_budgets` itself drops the heuristic entirely
+/// once every store it reads from has passed through this migration.
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
@@ -325,7 +340,7 @@ impl PostgresStore {
                 Err(e) => return Err(StoreError(e.to_string())),
             };
         let mut tx = client.transaction().store()?;
-        if version < SCHEMA_VERSION {
+        if version < 5 {
             let legacy: bool = tx
                 .query_one(
                     "SELECT to_regclass('usage_counters') IS NOT NULL
@@ -353,6 +368,17 @@ impl PostgresStore {
             }
         }
         tx.batch_execute(SCHEMA).store()?;
+        // v6 one-time backfill — see SCHEMA_VERSION's doc comment for why this is safe as a
+        // gated-once value backfill and would NOT be safe as a repeated/per-boot heuristic. Only
+        // fires when crossing INTO v6 (a store already at v6+ never re-runs this).
+        if version < 6 {
+            tx.execute(
+                "UPDATE usage_windows SET billable_requests = requests \
+                 WHERE billable_requests = 0 AND requests > 0",
+                &[],
+            )
+            .store()?;
+        }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
