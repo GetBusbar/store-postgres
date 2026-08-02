@@ -32,7 +32,7 @@ env:
   # builds busbar-plugin-pack cleanly, then update this value in a reviewed PR — never track the
   # branch automatically. Update to a `main` SHA once busbar 1.5.0 actually ships; until then the
   # plugin ABI surface this crate depends on only exists on dev.
-  BUSBAR_REF: d7d1a81bd60b9318f89a8a9040e1f850af6943c1 # dev, as of 2026-07-31
+  BUSBAR_REF: 5b78db9fe0059a08907978f15bcde67e8cd757f9 # v1.5.0 release SHA (GetBusbar/busbar main, 2026-08-02)
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
