@@ -16,7 +16,7 @@ jobs:
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
-      busbar_ref: dev
+      busbar_ref: ${{ github.ref_name }}
       # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
       # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
       # exercise the monorepo's own copy of the store logic against the sibling busbarAI checkout's

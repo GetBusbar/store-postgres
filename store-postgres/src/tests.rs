@@ -567,9 +567,13 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
         .unwrap();
 
     // Interleave: a SEPARATE connection commits an add_usage that adds a brand-new model row and
-    // bumps requests, fully committed before this transaction's second read runs.
-    let interleaved = PostgresStore::connect(&url).expect("second connection");
-    interleaved
+    // bumps requests, fully committed before this transaction's second read runs. `store` is already
+    // an independent connection from the snapshot's `client` (a distinct `Client::connect` above) and
+    // is idle here, so it IS the required separate writer -- reusing it (rather than opening a third
+    // connection) keeps the interleave semantics identical while removing a connect()/migrate() that
+    // could fail under a shared CI Postgres's connection pressure (the observed gate flake: the third
+    // connect's `.expect` panicked, never the isolation assertion below).
+    store
         .add_usage(
             bucket,
             ws,

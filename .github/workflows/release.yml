@@ -17,6 +17,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-*"        # never fire on a pre-release / staging tag (e.g. v1.5.2-rc.1) — only final v* tags publish
 
 permissions:
   contents: write      # create the Release + upload assets
