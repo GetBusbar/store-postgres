@@ -68,6 +68,51 @@ fn live_url() -> Option<String> {
     }
 }
 
+/// Open a raw `postgres::Client` with bounded retry-with-backoff. Used only where a test genuinely
+/// needs a SECOND connection independent of the store's (e.g. holding a REPEATABLE READ snapshot
+/// open on one connection while the store writes on its own) -- there the connection cannot be
+/// reused away. Under the core gate's parallel-test load against a shared Postgres, a single
+/// `Client::connect` can be transiently refused on connection pressure; retrying a handful of times
+/// over a few seconds absorbs that transient without weakening any isolation assertion. ~10 tries
+/// over ~2.5s total, then the last error surfaces as before.
+fn connect_client_with_retry(url: &str) -> postgres::Client {
+    let mut last_err = None;
+    for attempt in 0..10u32 {
+        match postgres::Client::connect(url, postgres::NoTls) {
+            Ok(c) => return c,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+            }
+        }
+    }
+    panic!("connect (after retries): {:?}", last_err.unwrap());
+}
+
+/// `PostgresStore::connect` with bounded retry-with-backoff. Each connect opens a fresh connection
+/// AND runs `migrate()`, so under the core gate's parallel-test load against a shared Postgres a
+/// single connect can be TRANSIENTLY refused when the server is momentarily at its connection
+/// ceiling (surfacing as `StoreError("db error")` / too-many-clients) -- the exact class of flake
+/// the gate hit on the isolation test's connect. Every live-DB test needs at least this one store
+/// connection, so footprint reduction alone can't harden the primary connect; retrying ~10 times
+/// over a couple of seconds absorbs the transient. Returns the same `StoreResult` `connect` does, so
+/// each caller keeps its own `.expect(...)` message. NOT used where a connect is EXPECTED to fail
+/// (the permission test asserts `.is_err()` directly and must not spin on a genuine, persistent
+/// error).
+fn connect_store_with_retry(url: &str) -> StoreResult<PostgresStore> {
+    let mut last_err = None;
+    for attempt in 0..10u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+        }
+        match PostgresStore::connect(url) {
+            Ok(store) => return Ok(store),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop ran at least once"))
+}
+
 /// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
 /// reset a row by design), this raw-SQL wipe gives each test a genuinely clean slate for its id, so
 /// re-running the suite (or running it twice, as red-before-green proofs do) never sees stale state
@@ -123,7 +168,7 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 #[test]
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     hard_reset(&store, "vk_rt1");
     hard_reset(&store, "vk_rt2");
 
@@ -158,7 +203,7 @@ fn key_roundtrip_new_fields() {
 #[test]
 fn delete_key_is_a_tombstone_not_a_hard_delete() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_tombstone1";
     hard_reset(&store, id);
 
@@ -211,7 +256,7 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 #[test]
 fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_remint_over_tombstone1";
     hard_reset(&store, id);
 
@@ -252,7 +297,7 @@ fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
 #[test]
 fn scrub_key_requires_tombstone_first() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_scrub1";
     hard_reset(&store, id);
 
@@ -280,7 +325,7 @@ fn scrub_key_requires_tombstone_first() {
 #[test]
 fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_slotguard1";
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
@@ -329,7 +374,7 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 #[test]
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_updated_at1";
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
@@ -360,7 +405,7 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
 #[test]
 fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_revoke1";
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
@@ -413,7 +458,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
 #[test]
 fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_hydrate1";
     hard_reset(&store, id);
 
@@ -463,8 +508,8 @@ fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() 
 #[test]
 fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let Some(url) = live_url() else { return };
-    let store_a = PostgresStore::connect(&url).expect("connect a");
-    let store_b = PostgresStore::connect(&url).expect("connect b");
+    let store_a = connect_store_with_retry(&url).expect("connect a");
+    let store_b = connect_store_with_retry(&url).expect("connect b");
     let id = "vk_concurrent_del1";
     hard_reset(&store_a, id);
     store_a.put_key(&sample_key(id)).unwrap();
@@ -474,7 +519,7 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let url_b = url.clone();
     let id_b = id.to_string();
     let handle = std::thread::spawn(move || {
-        let store_b2 = PostgresStore::connect(&url_b).expect("connect b2");
+        let store_b2 = connect_store_with_retry(&url_b).expect("connect b2");
         store_b2.delete_key(&id_b)
     });
     let r1 = store_b.delete_key(id);
@@ -493,14 +538,27 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
 #[test]
 fn get_usage_transaction_is_actually_repeatable_read() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
-    let level: String = tx
-        .query_one("SHOW transaction_isolation", &[])
-        .unwrap()
-        .get(0);
-    tx.commit().unwrap();
+    let store = connect_store_with_retry(&url).expect("connect");
+    // Drive the isolation check through the store's OWN connection -- the exact same client
+    // get_usage uses -- rather than opening a second raw `postgres::Client`. That extra, uncounted
+    // connection was pure connection-footprint overhead here (this assertion never needed a
+    // *separate* connection, only a real one), and under the core gate's parallel-test load against
+    // a shared Postgres its `.connect()` transiently failed on connection pressure -- the observed
+    // flake panicked at this test's connect path (`connect: StoreError("db error")`), never on the
+    // isolation assertion below. Reusing the store's client (extending what b2f3804 did for the
+    // sibling torn-read test) halves this test's connection count and removes the refuse-able
+    // connect, while testing the real helper against a real client just as faithfully. The scope
+    // guard releases the store lock before `get_usage` (which re-locks the same mutex) is called.
+    let level: String = {
+        let mut client = store.lock();
+        let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
+        let level: String = tx
+            .query_one("SHOW transaction_isolation", &[])
+            .unwrap()
+            .get(0);
+        tx.commit().unwrap();
+        level
+    };
     assert_eq!(
         level, "repeatable read",
         "get_usage's helper must actually open REPEATABLE READ"
@@ -524,7 +582,7 @@ fn get_usage_transaction_is_actually_repeatable_read() {
 #[test]
 fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let bucket = "vk_torn_read1";
     let ws = 20_270_301u64;
     hard_reset(&store, bucket);
@@ -557,7 +615,11 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
         .unwrap();
 
     // Open the snapshot and take the FIRST of get_usage's two reads (the requests row) manually.
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // This SECOND connection is genuinely required (the snapshot must stay open here while `store`
+    // writes on its own connection below), so it can't be reused away like the sibling isolation
+    // test's -- instead its connect is bounded-retried to absorb transient connection-pressure
+    // refusals under the gate's parallel load.
+    let mut client = connect_client_with_retry(&url);
     let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
     let _requests_row = tx
         .query_one(
@@ -629,7 +691,7 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
 #[test]
 fn metering_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let bucket = 20_270_101u64;
     hard_reset(&store, "vk_meter_new1");
     store
@@ -723,7 +785,7 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 #[test]
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     hard_reset(&store, "vk_labels_rt");
 
     let mut k = sample_key("vk_labels_rt");
@@ -772,7 +834,7 @@ fn secret_form_storage_round_trip_all_variants() {
 #[test]
 fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let bucket = "vk_multi_model_batch";
     let ws = 20_270_401u64;
     let ws2 = ws + 1;
@@ -895,7 +957,7 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
 #[test]
 fn append_audit_is_append_only_and_rejects_a_seq_collision() {
     let Some(url) = live_url() else { return };
-    let store = PostgresStore::connect(&url).expect("connect");
+    let store = connect_store_with_retry(&url).expect("connect");
     let seq = 900_000_001u64;
     let _ = store
         .lock()
@@ -1019,7 +1081,8 @@ fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
             .unwrap();
     }
 
-    let store = PostgresStore::connect(&iso_url).expect("connect must bootstrap a fresh database");
+    let store =
+        connect_store_with_retry(&iso_url).expect("connect must bootstrap a fresh database");
 
     let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     let legacy_gone: bool = check
@@ -1067,7 +1130,7 @@ fn migrate_already_at_current_version_skips_the_legacy_check() {
         .unwrap();
     }
 
-    let store = PostgresStore::connect(&iso_url).expect("connect");
+    let store = connect_store_with_retry(&iso_url).expect("connect");
 
     let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     let legacy_still_there: bool = check
@@ -1113,7 +1176,7 @@ fn migrate_v6_backfills_billable_requests_for_a_pre_migration_row() {
         .unwrap();
     }
 
-    let store = PostgresStore::connect(&iso_url).expect("connect must run the v6 migration");
+    let store = connect_store_with_retry(&iso_url).expect("connect must run the v6 migration");
 
     let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     let billable: i64 = check
@@ -1167,7 +1230,7 @@ fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
         .unwrap();
     }
 
-    let store = PostgresStore::connect(&iso_url).expect("connect");
+    let store = connect_store_with_retry(&iso_url).expect("connect");
 
     let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     let billable: i64 = check
