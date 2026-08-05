@@ -7,7 +7,10 @@ on:
     branches: [main, dev, qa]
   pull_request:
     branches: [main, dev, qa]
-
+  # Manual trigger. Needed because `gh run rerun` PINS the reusable-workflow SHA:
+  # a rerun re-uses the plugin-ci.yml snapshot from the original run, so a fix landing in
+  # core's reusable workflow can only be picked up by a NEW run, never by rerunning an old one.
+  workflow_dispatch: {}
 jobs:
   ci:
     uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
