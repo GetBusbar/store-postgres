@@ -261,8 +261,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         eprintln!("skip: store-postgres-plugin cdylib not built");
         return;
     };
-    let key_id = "vk_pg_adminapi_e2e";
-    cleanup(&url, key_id);
+    // No pre-test `cleanup` of a hardcoded id: the key this test writes is server-generated, so a
+    // fixed id cleans up nothing and only gives a false sense of a clean slate. The real cleanup is
+    // of `minted_id`, at the end, once it exists.
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -382,9 +383,19 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     // full request body can legitimately close the connection rather than complete a clean 401
     // response -- so either outcome (a 401 status, or the connection itself being refused/reset)
     // counts as proof the write was rejected; only a 2xx success would mean the guard is missing.
+    // Install under a DIFFERENT target filename, so "did the write apply" is observable. Re-posting
+    // the byte-identical body that already installed successfully makes rejection and re-application
+    // indistinguishable: no state check can tell them apart, so the whole block would rest on the
+    // status code alone. With a distinct target, the file must NOT appear in plugins.dir and the
+    // catalog must NOT list it, whichever way the request came back.
+    let unauth_file = "store-postgres-unauthorized.tar.gz";
+    let unauth_body = serde_json::json!({
+        "file": unauth_file,
+        "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball_bytes),
+    });
     match client
         .post(format!("{admin_base}/plugins"))
-        .json(&install_body)
+        .json(&unauth_body)
         .send()
     {
         Ok(unauth) => assert_eq!(
@@ -416,6 +427,27 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             );
         }
     }
+    // THE assertion that carries the weight, and it holds on both arms: whatever the transport did,
+    // the unauthenticated write must not have taken effect.
+    assert!(
+        !plugins_dir.join(unauth_file).exists(),
+        "an unauthenticated install must not write a tarball into plugins.dir"
+    );
+    let after_unauth: serde_json::Value = client
+        .get(format!("{admin_base}/plugins?type=store"))
+        .header("x-admin-token", admin_token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(
+        !after_unauth["items"]
+            .as_array()
+            .expect("plugins list has items")
+            .iter()
+            .any(|p| p["target"] == unauth_file),
+        "an unauthenticated install must not appear in the real catalog"
+    );
 
     // Confirm the real catalog reports it (not just a 201 with no lasting effect).
     let list: serde_json::Value = client

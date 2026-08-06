@@ -49,12 +49,85 @@ use std::time::{Duration, Instant};
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
 /// unwinds partway through the test (unlike a manual `child.kill()` call placed after the code that
 /// might panic, which never runs if an earlier assertion fails first).
-struct ChildGuard(Child);
+///
+/// It also owns the file this child's stdout+stderr were redirected to, and that is load-bearing
+/// rather than bookkeeping. This boot used to run with `.stderr(Stdio::null())`, so a failed boot
+/// could only ever report an exit code while busbar's own explanation was discarded at the point it
+/// was produced. That cost `admin_api_e2e.rs` a qa-gate leg once already, and it matters more here:
+/// this test boots against a database that has never existed before, so a first-run-only failure
+/// has no other trace anywhere.
+///
+/// A FILE, not `Stdio::piped()`: nothing reads the pipe while the child runs, so a child that
+/// out-talked the pipe buffer would block forever on write and turn a clean failure into a hang.
+struct ChildGuard(Child, PathBuf);
+
+impl ChildGuard {
+    fn output(&self) -> String {
+        std::fs::read_to_string(&self.1).unwrap_or_else(|e| format!("<log unreadable: {e}>"))
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// A disposable database that drops itself on drop, panic path included. Written as a trailing
+/// statement, the cleanup only ran when the test passed, so every red run leaked a fully migrated
+/// database under a pid+nanos name that nothing would ever reclaim.
+struct TempDb {
+    admin_url: String,
+    name: String,
+}
+
+impl TempDb {
+    fn create(admin_url: &str, prefix: &str) -> Self {
+        let name = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut maint = postgres::Client::connect(admin_url, postgres::NoTls)
+            .expect("connect to create the disposable database");
+        let _ = maint.execute(&format!("DROP DATABASE IF EXISTS {name}"), &[]);
+        maint
+            .execute(&format!("CREATE DATABASE {name}"), &[])
+            .expect("the boot proof needs its own empty database");
+        Self {
+            admin_url: admin_url.to_string(),
+            name,
+        }
+    }
+
+    /// Rewrite the admin DSN to name this database, keeping the credentials. The shape is the one
+    /// this crate's own fixtures and `dsn_password` already assume.
+    fn url(&self) -> String {
+        let rest = self
+            .admin_url
+            .split("://")
+            .nth(1)
+            .expect("url must have a scheme");
+        let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
+        let (host_port, _) = host_and_db
+            .split_once('/')
+            .expect("url must have a db path");
+        format!("postgres://{userinfo}@{host_port}/{}", self.name)
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        if let Ok(mut maint) = postgres::Client::connect(&self.admin_url, postgres::NoTls) {
+            let _ = maint.execute(
+                &format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name),
+                &[],
+            );
+        }
     }
 }
 
@@ -111,54 +184,6 @@ fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
-/// A suffix unique across concurrently running test binaries against the SAME Postgres instance.
-fn unique_suffix() -> String {
-    format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
-}
-
-/// Rewrite a `postgres://user:pass@host:port/db` URL to name a different database on the same
-/// server, keeping the credentials. The shape is the one this crate's own fixtures and
-/// `dsn_password` already assume.
-fn isolated_db_url(url: &str, db_name: &str) -> String {
-    let rest = url.split("://").nth(1).expect("url must have a scheme");
-    let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
-    let (host_port, _) = host_and_db
-        .split_once('/')
-        .expect("url must have a db path");
-    format!("postgres://{userinfo}@{host_port}/{db_name}")
-}
-
-/// Create a genuinely empty database. The boot proof below rests entirely on this: the shared CI
-/// database already carries a `keys` table by the time this binary runs (every live unit test opens
-/// a `PostgresStore`, and `connect` migrates), so polling it for that table cannot distinguish "this
-/// boot created the schema" from "it was already there" -- the poll would break true on its first
-/// iteration even if `busbar` had failed to load the plugin and exited immediately.
-fn create_fresh_database(url: &str, db_name: &str) -> bool {
-    let Ok(mut maint) = postgres::Client::connect(url, postgres::NoTls) else {
-        return false;
-    };
-    let _ = maint.execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[]);
-    maint
-        .execute(&format!("CREATE DATABASE {db_name}"), &[])
-        .is_ok()
-}
-
-fn drop_database(url: &str, db_name: &str) {
-    if let Ok(mut maint) = postgres::Client::connect(url, postgres::NoTls) {
-        let _ = maint.execute(
-            &format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"),
-            &[],
-        );
-    }
-}
-
 /// The sibling busbarAI checkout's root (same convention this repo already uses for its path deps).
 fn busbarai_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -208,14 +233,11 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         return;
     };
 
-    // A DISPOSABLE, genuinely empty database, created before the boot and dropped after it. The
-    // schema this test polls for can then only have come from the boot under test.
-    let db = format!("spg_filedrop_{}", unique_suffix());
-    assert!(
-        create_fresh_database(&admin_url, &db),
-        "the file-drop boot proof needs its own empty database; creating {db} failed"
-    );
-    let url = isolated_db_url(&admin_url, &db);
+    // A DISPOSABLE, genuinely empty database. The schema this test polls for can then only have
+    // come from the boot under test. The guard drops it on the panic path too, so a red run does
+    // not leave a migrated database behind on the shared server forever.
+    let tmp = TempDb::create(&admin_url, "spg_filedrop");
+    let url = tmp.url();
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -316,15 +338,18 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // proof only because the database above was created empty for this test alone: against the
     // shared database every other test in this workspace migrates, `keys` already exists and the
     // poll would succeed on its first iteration no matter what the child process did.
+    let boot_log = work.join("boot.log");
+    let boot_log_out = std::fs::File::create(&boot_log).expect("create the boot log");
+    let boot_log_err = boot_log_out.try_clone().expect("dup the boot log handle");
     let child = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(boot_log_out))
+        .stderr(Stdio::from(boot_log_err))
         .spawn()
         .expect("spawn a real busbar boot");
-    let mut guard = ChildGuard(child);
+    let mut guard = ChildGuard(child, boot_log);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let booted = loop {
@@ -340,7 +365,11 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
             }
         }
         if let Ok(Some(status)) = guard.0.try_wait() {
-            panic!("busbar exited before creating the postgres schema (status: {status})");
+            panic!(
+                "busbar exited before creating the postgres schema (status: {status})\n\
+                 --- boot output ---\n{}",
+                guard.output()
+            );
         }
         if Instant::now() >= deadline {
             break false;
@@ -351,7 +380,8 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         booted,
         "a real busbar boot with the file-dropped postgres plugin must create the `keys` table \
          (via Store::connect/migrate) within 15s -- proof the real dlopen+connect path executed \
-         during boot, not a no-op"
+         during boot, not a no-op\n--- boot output ---\n{}",
+        guard.output()
     );
 
     // The boot did not just create a table, it landed the CURRENT schema: read the version the
@@ -373,7 +403,8 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     assert!(
         matches!(guard.0.try_wait(), Ok(None)),
         "the real busbar boot must still be running on the file-dropped postgres store, not have \
-         exited after creating the schema"
+         exited after creating the schema\n--- boot output ---\n{}",
+        guard.output()
     );
 
     // Only AFTER those proofs: a second, independent PostgresStore::connect (bypassing the
@@ -388,7 +419,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     drop(raw);
     drop(guard); // explicit: stop the real busbar process before dropping its database
     let _ = std::fs::remove_dir_all(&work);
-    drop_database(&admin_url, &db);
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
