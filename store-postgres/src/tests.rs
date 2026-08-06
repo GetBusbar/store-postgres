@@ -744,8 +744,8 @@ fn percent_decode_edge_cases() {
 
 /// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
 /// recognize from every other error class -- pinned against two REAL postgres errors (never a
-/// hand-built one, since `postgres::Error` has no public constructor) so both the `==`/`!=` and the
-/// whole-function true/false mutants are caught.
+/// hand-built one, since `postgres::Error` has no public constructor), so neither an inverted
+/// comparison nor an unconditional true/false would pass.
 #[test]
 fn is_undefined_table_matches_only_the_real_sqlstate() {
     let Some(url) = live_url() else { return };
@@ -772,9 +772,9 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 /// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
 /// non-empty label set. `sample_key`'s `Default::default()` labels are empty, and `serde_json` of
 /// an empty `BTreeMap` is `"{}"`, the SAME string `labels_to_storage`'s own error fallback returns,
-/// so a mutant that replaced the whole function with `String::new()` still round-tripped an empty
-/// map back to an empty map -- only a NON-empty label set can tell `"{}"` (correct) apart from `""`
-/// (the mutant), since `labels_from_storage("")` also happens to default to an empty map.
+/// so a `labels_to_storage` that returned `String::new()` unconditionally would still round-trip an
+/// empty map back to an empty map. Only a NON-empty label set can tell `"{}"` (correct) apart from
+/// `""`, since `labels_from_storage("")` also defaults to an empty map.
 #[test]
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
