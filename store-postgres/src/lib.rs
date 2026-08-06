@@ -375,8 +375,13 @@ impl PostgresStore {
     /// local socket.
     pub fn connect(conn_str: &str) -> StoreResult<Self> {
         let secret = dsn_password(conn_str);
+        // `render_pg_error`, not `e.to_string()`. A server-side refusal (bad database name, failed
+        // authentication, an unavailable extension) is a `db_error` whose Display is the literal
+        // two words "db error" — so the ONE error an operator hits before anything else works
+        // rendered as the least actionable string in the crate, while every query error had already
+        // been fixed to carry its SQLSTATE and message. Still scrubbed of the DSN password.
         let client = Client::connect(conn_str, NoTls)
-            .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
+            .map_err(|e| StoreError(scrub(render_pg_error(&e), secret.as_deref())))?;
         let store = Self {
             client: Mutex::new(client),
         };
@@ -608,7 +613,15 @@ impl Store for PostgresStore {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         let rev = Self::next_revision(&mut tx)?;
-        tx.execute(
+        // The `WHERE` on the conflict branch is the TOMBSTONE PRECONDITION (see `Store::put_key`):
+        // a live-shaped write (`EXCLUDED.deleted_at IS NULL`) must not overwrite a tombstoned row,
+        // which would reissue an id the contract says is never reissued and revive every token
+        // minted before the delete. It rides on the statement rather than a preceding SELECT for
+        // the same reason `delete_key`'s `AND deleted_at IS NULL` does: under READ COMMITTED the
+        // conflict branch re-evaluates its WHERE against post-lock committed data, so this actually
+        // closes the TOCTOU window a separate SELECT leaves wide open.
+        // A write that CARRIES a tombstone is unaffected and still applies.
+        let changed = tx.execute(
             "INSERT INTO keys
                 (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -617,13 +630,23 @@ impl Store for PostgresStore {
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
                 expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
-                revision=EXCLUDED.revision",
+                revision=EXCLUDED.revision
+             WHERE EXCLUDED.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
                 &key.group, &labels, &expires, &deleted, &rev,
             ],
         )
         .store()?;
+        if changed == 0 {
+            // The conflict branch matched a row but its WHERE rejected the write: the stored row is
+            // tombstoned and this one is not. That is the only way to reach 0 here.
+            return Err(StoreError(format!(
+                "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
+                 tombstone",
+                key.id
+            )));
+        }
         tx.commit().store()?;
         Ok(())
     }
@@ -669,10 +692,12 @@ impl Store for PostgresStore {
             .map(|r| r.get(0));
         match already_deleted {
             None => {
-                // Unknown id: idempotent no-op per the trait doc (delete_key is defined idempotent;
-                // an unknown id is not distinguished from an already-tombstoned one at this layer).
-                tx.commit().store()?;
-                return Ok(());
+                // Unknown id: an ERROR, and deliberately NOT the same case as the already-tombstoned
+                // one below. The trait settles them apart because "already tombstoned" means the
+                // operator's intent is satisfied and the evidence is on disk, while "no such id"
+                // means nothing was touched - and answering Ok there tells an operator who typo'd
+                // an id that a key was revoked when none was.
+                return Err(StoreError(format!("delete_key: unknown id '{id}'")));
             }
             Some(true) => {
                 // Already tombstoned: no-op, not an error.
@@ -1040,7 +1065,16 @@ impl Store for PostgresStore {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         let rev = Self::next_revision(&mut tx)?;
-        tx.execute(
+        // Same TOMBSTONE PRECONDITION as `put_key`, and this is the path where it MATTERS MOST: the
+        // conflict branch used to set `deleted_at=NULL` outright, so re-minting over a tombstoned id
+        // deliberately cleared the tombstone. That was written to avoid leaving a row both enabled
+        // and deleted (which a CHECK constraint forbids), but the contract's answer to that is to
+        // REFUSE the write, not to reissue an id `VirtualKey::deleted_at` says is never reissued and
+        // revive every token minted before the delete.
+        //
+        // The insert always supplies `deleted_at = NULL` (a mint is live by construction), so the
+        // guard here is simply "the stored row must not be a tombstone".
+        let changed = tx.execute(
             "INSERT INTO keys
                 (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10)
@@ -1048,13 +1082,21 @@ impl Store for PostgresStore {
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
-                expires_at=EXCLUDED.expires_at, deleted_at=NULL, revision=EXCLUDED.revision",
+                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision
+             WHERE keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
                 &key.group, &labels, &expires, &rev,
             ],
         )
         .store()?;
+        if changed == 0 {
+            return Err(StoreError(format!(
+                "put_key_with_credential: '{}' is tombstoned and its id is never reissued; \
+                 refusing to clear the tombstone",
+                key.id
+            )));
+        }
         Self::put_credential_tx(&mut tx, secret)?;
         tx.commit().store()?;
         Ok(())
@@ -1198,11 +1240,32 @@ impl Store for PostgresStore {
             )
             .store()?;
         if inserted == 0 {
-            return Err(StoreError(format!(
-                "append_audit: seq {} already exists in audit_log; refusing to silently overwrite \
-                 a durable audit entry (the append-only contract forbids rewriting a prior hash)",
-                entry.seq
-            )));
+            // A collision has TWO causes and they are not the same event. Erroring on both (which
+            // this used to do) makes the engine's own write-through look like a corrupt chain the
+            // first time a commit ACK is lost to a timeout or a reconnect and it retries. Compare
+            // the records and let the difference decide, per the trait contract:
+            //   identical -> the retry. Benign, and the common one. Ok.
+            //   different -> two records claiming one chain position: forked or tampered. Error.
+            let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1");
+            let stored = self
+                .lock()
+                .query_opt(&sql, &[&seq])
+                .store()?
+                .map(|r| row_to_audit(&r));
+            match stored {
+                // Gone between the INSERT and this read (a concurrent purge). Nothing occupies the
+                // seq now, so there is no fork to report and no record to keep; treating it as a
+                // benign no-op is the only answer that is not an invented failure.
+                None => return Ok(()),
+                Some(stored) if &stored == entry => return Ok(()),
+                Some(stored) => {
+                    return Err(StoreError(format!(
+                        "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
+                         has forked (stored action '{}', incoming '{}')",
+                        entry.seq, stored.action, entry.action
+                    )))
+                }
+            }
         }
         Ok(())
     }

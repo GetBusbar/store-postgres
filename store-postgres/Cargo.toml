@@ -15,3 +15,9 @@ license = "Apache-2.0"
 busbar-api = { path = "../../busbarAI/crates/api" }
 postgres = "0.19"
 serde_json = "1"
+
+[dev-dependencies]
+# The shared `Store` contract conformance suite, so the four behaviours the fleet used to disagree
+# on are asserted from ONE place rather than hand-copied into each backend, which is how they
+# drifted apart to begin with.
+busbar-plugin-testkit = { path = "../../busbarAI/crates/plugin-testkit", features = ["store"] }

@@ -318,16 +318,17 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     );
 }
 
-/// put_key_with_credential's ON CONFLICT path must clear a stale tombstone: re-minting over an id
-/// that was previously deleted (deleted_at set, enabled=false by delete_key) must produce a fully
-/// LIVE key, not one that is enabled=true while still marked deleted_at.
+/// put_key_with_credential must REFUSE to re-mint over a tombstoned id.
 ///
-/// An ON CONFLICT UPDATE SET clause that omits `deleted_at=NULL` fails at the `deleted_at`
-/// assertion below: `enabled` flips to `true` as the caller intended, but `deleted_at` is left at
-/// whatever the tombstone set it to, so the row is simultaneously "enabled" and "deleted" -- exactly
-/// the corrupt state this test guards against.
+/// This test used to assert the opposite: that the ON CONFLICT path CLEARS a stale tombstone so a
+/// re-mint produces a fully live key. The problem it was solving is real -- an UPDATE SET that omits
+/// `deleted_at` leaves the row simultaneously enabled and deleted, a corrupt half-state a CHECK
+/// constraint forbids -- but clearing the tombstone is the wrong way out of it.
+/// `VirtualKey::deleted_at` and `Store::delete_key` both say the id is never reissued, so silently
+/// reviving one takes back an operator's revocation and revalidates every token minted before it.
+/// Refusing the write avoids the corrupt half-state just as completely and keeps the contract.
 #[test]
-fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
+fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_remint_over_tombstone1";
@@ -347,22 +348,31 @@ fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
     remint.enabled = true;
     remint.deleted_at = None;
     let remint_cred = sample_cred(id, 0, "AKIA_REMINT1_NEW");
-    store
+    let err = store
         .put_key_with_credential(&remint, &remint_cred)
-        .expect("re-mint over a tombstoned id must succeed, not violate keys_tombstone_disabled");
-
-    let after = store.get_key(id).unwrap().unwrap();
-    assert!(after.enabled, "the re-minted key must be enabled");
+        .expect_err("re-minting over a tombstoned id must be refused, not silently resurrected");
     assert!(
-        after.deleted_at.is_none(),
-        "the re-minted key must have its stale tombstone cleared, not be simultaneously enabled \
-         and deleted: got deleted_at={:?}",
-        after.deleted_at
+        err.to_string().contains("never reissued"),
+        "the refusal must say why: {err}"
     );
-    assert_eq!(
-        store.list_credentials(id).unwrap().len(),
-        1,
-        "the re-minted credential must be present"
+
+    // The tombstone stands, and the row is NOT left in the corrupt enabled-and-deleted state the
+    // original version of this test was written to prevent.
+    let after = store.get_key(id).unwrap().unwrap();
+    assert!(
+        after.deleted_at.is_some(),
+        "the tombstone must survive the refused re-mint"
+    );
+    assert!(
+        !after.enabled,
+        "the refused re-mint must not have flipped enabled: {after:?}"
+    );
+
+    // ATOMICITY: the credential half must not have landed either. A partial apply here would be
+    // worse than the resurrection, since it would leave live secret material for a deleted key.
+    assert!(
+        store.list_credentials(id).unwrap().is_empty(),
+        "a refused re-mint must not write the paired credential"
     );
 }
 
@@ -1932,4 +1942,83 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
         "migrate must never silently succeed against a role that can't actually read its own \
          bookkeeping table"
     );
+}
+
+/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
+/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
+/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+///
+/// Every fixture is namespaced by process id and the rows are hard-reset first, for the same reason
+/// `append_audit_is_append_only_and_rejects_a_seq_collision` derives its own seq: this suite runs
+/// against a SHARED live database that is not reset between tests, and CI can have more than one
+/// test binary pointed at it, so a fixed id would make two concurrent runs each other's failure.
+mod conformance {
+    use super::{clamp, connect_store_with_retry, live_url, PostgresStore};
+    use busbar_plugin_testkit::store_conformance as conf;
+
+    /// A per-process, PER-CHECK namespace. Short enough for every id column in the schema.
+    ///
+    /// Per-check matters as much as per-process: `reset` clears every id in the namespace it is
+    /// given, and these tests run in parallel in one binary, so a single shared namespace would
+    /// have each check deleting the others' rows out from under them mid-run.
+    fn ns(check: &str) -> String {
+        format!("vk_c{}{}", std::process::id(), check)
+    }
+
+    /// Delete every row this suite is about to write, so a rerun (or a crashed prior run that left
+    /// rows behind) starts from the same state as a first run.
+    fn reset(store: &PostgresStore, ns: &str, seq: u64) {
+        let mut client = store.lock();
+        for id in conf::key_ids(ns) {
+            let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
+            let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
+        }
+        for id in conf::credential_ids(ns) {
+            let _ = client.execute("DELETE FROM credentials WHERE id=$1", &[&id]);
+        }
+        let _ = client.execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+    }
+
+    fn setup(check: &str, seq: u64) -> Option<(PostgresStore, String)> {
+        let url = live_url()?;
+        let store = connect_store_with_retry(&url).expect("connect");
+        let ns = ns(check);
+        reset(&store, &ns, seq);
+        Some((store, ns))
+    }
+
+    #[test]
+    fn put_key_does_not_resurrect_a_tombstone() {
+        let Some((store, ns)) = setup("put", 0) else {
+            return;
+        };
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&store, &ns);
+    }
+
+    #[test]
+    fn delete_key_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("del", 0) else {
+            return;
+        };
+        conf::assert_delete_key_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn revoke_credential_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("rev", 0) else {
+            return;
+        };
+        conf::assert_revoke_credential_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
+        // Same derivation as the hand-written collision test above, offset so the two cannot pick
+        // the same seq within one process.
+        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
+        let Some((store, _ns)) = setup("aud", seq) else {
+            return;
+        };
+        conf::assert_append_audit_duplicate_seq(&store, seq);
+    }
 }
