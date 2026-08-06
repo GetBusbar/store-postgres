@@ -50,7 +50,30 @@ trait IntoStoreResult<T> {
 }
 impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
     fn store(self) -> StoreResult<T> {
-        self.map_err(|e| StoreError(e.to_string()))
+        self.map_err(|e| StoreError(render_pg_error(&e)))
+    }
+}
+
+/// Render a driver error with its CAUSE attached. `postgres::Error`'s own `Display` for a
+/// server-side failure is the literal string "db error" and nothing else: the SQLSTATE, the server
+/// message and the violated constraint all live behind `as_db_error()`. Mapping straight through
+/// `to_string()` therefore handed operators (and this crate's own callers) a two-word error for
+/// every constraint violation, permission failure and bad statement alike, which is unactionable
+/// and indistinguishable between causes.
+///
+/// The server's `detail` field is deliberately NOT included: on a unique violation Postgres puts
+/// the offending ROW VALUES in it, and this string reaches logs. The SQLSTATE, the primary message
+/// and the constraint name identify the failure without echoing data.
+fn render_pg_error(e: &postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let mut out = format!("{}: {}", db.code().code(), db.message());
+            if let Some(constraint) = db.constraint() {
+                out.push_str(&format!(" (constraint {constraint})"));
+            }
+            out
+        }
+        None => e.to_string(),
     }
 }
 
@@ -75,14 +98,81 @@ fn dsn_password(dsn: &str) -> Option<String> {
             }
         }
     }
-    for tok in dsn.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("password=") {
-            if !v.is_empty() {
-                return Some(v.to_string());
+    // The URL QUERY-PARAMETER form (`postgres://user@host/db?password=secret`). libpq accepts it,
+    // the README tells operators to use the query string for other options, and it does not go
+    // through the userinfo branch above, so without this it reached the keyword scan below and was
+    // never redacted.
+    if let Some((_, query)) = dsn.split_once('?') {
+        for param in query.split('&') {
+            if let Some(v) = param.strip_prefix("password=") {
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
             }
         }
     }
+    // The libpq KEYWORD form. libpq allows whitespace around the separator (`password = secret`)
+    // and single-quoted values (`password='se cret'`); a plain `strip_prefix("password=")` over
+    // whitespace tokens sees neither, returns None, and `scrub` then passes the connect error
+    // through with the secret intact. Collapse the whitespace around every `=` first, then match
+    // the key only at a token boundary so `sslpassword=` (a different libpq option) is not mistaken
+    // for it.
+    let normalized = collapse_around_equals(dsn);
+    let mut search = normalized.as_str();
+    while let Some(at) = search.find("password=") {
+        let at_token_start = at == 0
+            || search[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        let rest = &search[at + "password=".len()..];
+        if at_token_start {
+            let value = match rest.strip_prefix('\'') {
+                Some(quoted) => quoted.split('\'').next().unwrap_or(""),
+                None => rest.split_whitespace().next().unwrap_or(""),
+            };
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        search = rest;
+    }
     None
+}
+
+/// Remove whitespace immediately before and after every `=`, so `key = value` and `key=value`
+/// scan identically. Only used by `dsn_password`.
+fn collapse_around_equals(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            // Whitespace that only separates a key from its `=` is not a token boundary.
+            if !(j < chars.len() && chars[j] == '=') {
+                out.push(' ');
+            }
+            i = j;
+            continue;
+        }
+        if c == '=' {
+            out.push('=');
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Percent-DECODE a URL component (`%40` -> `@`). A malformed escape is left verbatim. So the scrub
@@ -1024,16 +1114,40 @@ impl Store for PostgresStore {
         // TOCTOU-safe: two concurrent revoke_credential calls on the same id now genuinely
         // serialize under Postgres' READ COMMITTED row-lock re-check, and only the first to commit
         // actually changes anything.
-        // Return value intentionally unread: whether this call or a concurrent winner actually
-        // changed the row, the outcome is the same idempotent success -- matching delete_key's
-        // shape. `next_revision`'s bump above going unused in the losing case is acceptable per its
-        // own doc (a monotonic counter with gaps).
-        tx.execute(
-            "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4
-             WHERE id=$1 AND revoked_at IS NULL",
-            &[&id, &clamp(now), &reason, &rev],
-        )
-        .store()?;
+        let changed = tx
+            .execute(
+                "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4
+                 WHERE id=$1 AND revoked_at IS NULL",
+                &[&id, &clamp(now), &reason, &rev],
+            )
+            .store()?;
+        if changed == 0 {
+            // Zero rows means one of two very different things, and the row count alone cannot tell
+            // them apart. Discarding it would put the unknown-id case straight back: the `EXISTS`
+            // above takes no row lock and runs before `next_revision`, so between the check and this
+            // UPDATE a concurrent mint into the freed slot can rewrite this row's PRIMARY KEY
+            // (`put_credential_tx` sets `id=EXCLUDED.id`), leaving the id naming nothing. Reported
+            // as success, that is the same "revoked, and yet still authenticating" outcome the
+            // unknown-id error above exists to prevent, just reached by a race instead of a typo.
+            // So ask again, inside this transaction, which of the two it was.
+            let still_exists: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=$1)",
+                    &[&id],
+                )
+                .store()?
+                .get(0);
+            if !still_exists {
+                return Err(StoreError(format!(
+                    "revoke_credential: credential id {id} existed when this call started and \
+                     names no row by the time the revocation was written (a concurrent mint into \
+                     the same slot rewrites the row's id); nothing was revoked"
+                )));
+            }
+            // The row is there and was already revoked: a true idempotent no-op, exactly what the
+            // trait promises. The revision bump above goes unused, which its own doc allows (a
+            // monotonic counter with gaps).
+        }
         tx.commit().store()?;
         Ok(())
     }
@@ -1111,11 +1225,15 @@ impl Store for PostgresStore {
     }
 
     fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        // `created_at` is a clock read, not the literal 0 it used to be. Same shape as the
+        // `deleted_at` defect: the row lands, every "is this subject denied" check keeps working,
+        // and only a question about WHEN it was denied reads back the epoch. store-sqlite writes
+        // `now_secs()` into the identical column.
         self.lock()
             .execute(
-                "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, 0)
+                "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, $3)
                  ON CONFLICT (sub) DO UPDATE SET reason = EXCLUDED.reason",
-                &[&sub, &reason],
+                &[&sub, &reason, &clamp(now_secs())],
             )
             .store()?;
         Ok(())

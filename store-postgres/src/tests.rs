@@ -40,6 +40,32 @@ fn dsn_password_extraction_and_scrub() {
     assert_eq!(dsn_password("postgres://host:5432/db"), None);
     assert_eq!(dsn_password("host=db user=u"), None);
 
+    // Spellings libpq accepts that a `password=` prefix match on a whitespace token does not see.
+    // Each one used to return None, which makes `scrub` a no-op and passes the connect error
+    // through with the secret in it.
+    assert_eq!(
+        dsn_password("host = db user = u password = spaced dbname = x").as_deref(),
+        Some("spaced"),
+        "libpq allows whitespace around '='"
+    );
+    assert_eq!(
+        dsn_password("host=db password='quoted secret' user=u").as_deref(),
+        Some("quoted secret"),
+        "libpq allows a single-quoted value, spaces included"
+    );
+    assert_eq!(
+        dsn_password("postgres://user@host:5432/db?password=inquery").as_deref(),
+        Some("inquery"),
+        "the URL query-parameter form is a real libpq spelling"
+    );
+    assert_eq!(
+        dsn_password("postgres://user@host:5432/db?connect_timeout=10&password=after").as_deref(),
+        Some("after"),
+        "password must be found among other query parameters"
+    );
+    // A key that merely ENDS in "password" is a different option and must not be mistaken for it.
+    assert_eq!(dsn_password("host=db sslpassword=notit user=u"), None);
+
     let raw = dsn_password("postgresql://u:p%40ss@host/db").unwrap();
     let leak = "could not connect: postgresql://u:p%40ss@host/db (auth p@ss)".to_string();
     let s = scrub(leak, Some(&raw));
@@ -258,9 +284,20 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
-    let before = now_secs();
+    // Bracketed with SystemTime DIRECTLY, never with the crate's own `now_secs()`: using the
+    // function under test as its own oracle means a `now_secs()` stubbed to a constant satisfies
+    // `before == deleted_at == after` and the test passes while every key in the store reports
+    // being deleted at that constant. The absolute floor below closes the same hole from the other
+    // side.
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let before = wall();
     store.delete_key(id).unwrap();
-    let after = now_secs();
+    let after = wall();
 
     let deleted_at = store
         .get_key(id)
@@ -273,6 +310,11 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
         "deleted_at must be the wall-clock second the delete landed (expected {before}..={after}), \
          got {deleted_at} -- a value far below the current Unix time means the revision counter was \
          bound to this column instead of a clock read"
+    );
+    assert!(
+        deleted_at > 1_700_000_000,
+        "deleted_at must be a plausible present-day Unix time, got {deleted_at} -- a small integer \
+         here is a counter, not a clock"
     );
 }
 
@@ -484,6 +526,19 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
         !resolved.meta.is_live(0),
         "a revoked credential must never read as live on the verify path"
     );
+    // POSITIVE CONTROL. Without it the assertion above is satisfied by an `is_live` that returns
+    // false unconditionally, since `sample_cred` sets `expires_at: None` and `!is_live` then
+    // reduces to the `revoked_at.is_some()` already asserted. The untouched slot-1 credential is
+    // the case that must come back LIVE, and it is the only thing here that can fail if liveness
+    // stops discriminating.
+    let untouched = store
+        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_B")
+        .unwrap()
+        .expect("the other slot's credential must still resolve");
+    assert!(
+        untouched.meta.is_live(0),
+        "the credential that was NOT revoked must read as live, or liveness is not discriminating"
+    );
 
     // Idempotent.
     store
@@ -518,13 +573,52 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
         err.0
     );
 
-    // The idempotent half: a real credential revoked twice succeeds both times.
+    // The idempotent half. Asserting only that the second call returns Ok pins almost nothing:
+    // deleting the `AND revoked_at IS NULL` guard, or the whole UPDATE, leaves both calls
+    // returning Ok. A no-op means the row is UNCHANGED, so read it back on both sides.
     let cred = sample_cred(id, 0, "AKIA_REVOKE_UNKNOWN1");
     store.put_credential(&cred).unwrap();
     store.revoke_credential(&cred.meta.id, "leaked").unwrap();
+    let after_first = store
+        .list_credentials(id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == cred.meta.id)
+        .expect("the revoked credential must still be listed");
+    assert!(
+        after_first.revoked_at.is_some(),
+        "the first revoke must actually revoke"
+    );
+    assert_eq!(after_first.revoke_reason.as_deref(), Some("leaked"));
+
     store
         .revoke_credential(&cred.meta.id, "leaked again")
         .expect("re-revoking an already-revoked credential must stay a no-op success");
+    let after_second = store
+        .list_credentials(id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == cred.meta.id)
+        .expect("the credential must still be listed");
+    assert_eq!(
+        after_second.revoke_reason.as_deref(),
+        Some("leaked"),
+        "a repeat revoke must NOT rewrite revoke_reason: the first revocation's recorded reason is \
+         the true one, and overwriting it loses why the credential was actually killed"
+    );
+    assert_eq!(
+        after_second.revoked_at, after_first.revoked_at,
+        "a repeat revoke must not move revoked_at"
+    );
+    assert_eq!(
+        after_second.updated_at, after_first.updated_at,
+        "a repeat revoke must not touch updated_at"
+    );
+    assert_eq!(
+        after_second.revision, after_first.revision,
+        "a repeat revoke must not burn a store-global revision, or every retry churns the \
+         hydration delta for a row that did not change"
+    );
 }
 
 /// HYDRATION-DELTA SOUNDNESS, the same invariant the SQLite and MySQL schemas have to hold. A
@@ -1032,7 +1126,10 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
 fn append_audit_is_append_only_and_rejects_a_seq_collision() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let seq = 900_000_001u64;
+    // Derived, not hardcoded: this writes into the SHARED, table-global `audit_log`, and a fixed
+    // seq means two concurrently running test binaries against the same database make each other's
+    // first insert the collision they are trying to detect.
+    let seq = 900_000_000u64 + (std::process::id() as u64 % 1_000_000);
     let _ = store
         .lock()
         .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
@@ -1098,10 +1195,27 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .lock()
         .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
 
+    let before = now_secs();
     store.add_denylist(&sub, "first reason").unwrap();
     assert!(
         store.list_denylist().unwrap().contains(&sub),
         "an added subject must appear in list_denylist"
+    );
+
+    // `created_at` is a wall-clock column and must be a clock read, not a convenient literal. The
+    // same shape delete_key had: the row is written, every "is this subject denied" check passes,
+    // and only a question about WHEN it was denied (an incident timeline, a retention sweep, a
+    // comparison against the sqlite backend, which writes now_secs() into the identical column)
+    // reads back 1970.
+    let created_at: i64 = store
+        .lock()
+        .query_one("SELECT created_at FROM denylist WHERE sub=$1", &[&sub])
+        .unwrap()
+        .get(0);
+    assert!(
+        read_u64(created_at) >= before,
+        "denylist.created_at must be the wall-clock second the subject was denied (expected at \
+         least {before}), got {created_at}"
     );
 
     store.add_denylist(&sub, "corrected reason").unwrap();
@@ -1130,62 +1244,86 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
 }
 
-/// `list_audit_tail` must return the tail OLDEST FIRST. It queries `ORDER BY seq DESC LIMIT n` and
-/// reverses in Rust, so dropping the reverse still returns the right n entries, still passes any
+/// `list_audit_tail` must return the tail OLDEST FIRST, and `list_audit` must return the whole log
+/// in the same direction. `list_audit_tail` queries `ORDER BY seq DESC LIMIT n` and reverses in
+/// Rust, so dropping the reverse still returns the right n entries, still passes any
 /// set-membership assertion, and hands every hash-chain verifier the chain backwards. Ordering is
 /// the only assertion that can see it.
+///
+/// Runs against its OWN disposable database, because `list_audit_tail` is a table-global
+/// `ORDER BY seq DESC LIMIT n` with no `WHERE`: on the shared database any row a sibling test
+/// writes with a higher seq occupies one of the n slots and evicts one of this test's own rows,
+/// which is a real flake and not a hypothetical (the append-audit test next door writes a fixed
+/// seq far above anything a pid-derived block here can reach). Filtering the result afterwards
+/// does not help, because the LIMIT is applied before the filter.
 #[test]
 fn list_audit_tail_returns_the_newest_entries_oldest_first() {
     let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    // A high, unique seq block so this cannot collide with a concurrently running test's entries.
-    let base = 800_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
-    for offset in 0..4u64 {
-        let _ = store.lock().execute(
-            "DELETE FROM audit_log WHERE seq=$1",
-            &[&clamp(base + offset)],
-        );
-    }
-    for offset in 0..4u64 {
+    let tmp = TempDb::create(&url, "spg_audittail");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+
+    for seq in 1..=4u64 {
         store
             .append_audit(&AuditRecord {
-                seq: base + offset,
-                ts: 1_700_000_000 + offset,
+                seq,
+                ts: 1_700_000_000 + seq,
                 action: "key.mint".into(),
-                resource: format!("key:{offset}"),
+                resource: format!("key:{seq}"),
                 outcome: "applied".into(),
                 principal: "vk_tail_test".into(),
-                prev_hash: format!("h{}", offset.saturating_sub(1)),
-                hash: format!("h{offset}"),
+                prev_hash: format!("h{}", seq - 1),
+                hash: format!("h{seq}"),
             })
             .unwrap();
     }
 
-    let tail = store.list_audit_tail(3).unwrap();
-    let ours: Vec<u64> = tail
+    let tail: Vec<u64> = store
+        .list_audit_tail(3)
+        .unwrap()
         .iter()
         .map(|r| r.seq)
-        .filter(|s| *s >= base && *s < base + 4)
         .collect();
     assert_eq!(
-        ours,
-        vec![base + 1, base + 2, base + 3],
+        tail,
+        vec![2, 3, 4],
         "list_audit_tail must return the NEWEST entries in OLDEST-FIRST order, so a hash-chain \
          verifier reads prev_hash -> hash forwards"
     );
 
-    for offset in 0..4u64 {
-        let _ = store.lock().execute(
-            "DELETE FROM audit_log WHERE seq=$1",
-            &[&clamp(base + offset)],
-        );
-    }
+    // A limit larger than the log returns everything, still oldest first.
+    let all_via_tail: Vec<u64> = store
+        .list_audit_tail(100)
+        .unwrap()
+        .iter()
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(all_via_tail, vec![1, 2, 3, 4]);
+
+    // `list_audit`, the full read, was previously called by no test at all: an implementation
+    // returning an empty vec, or dropping its ORDER BY, passed the whole suite.
+    let full = store.list_audit().unwrap();
+    assert_eq!(
+        full.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "list_audit must return the whole log in seq order"
+    );
+    assert_eq!(full[0].hash, "h1", "the records themselves must round-trip");
+    assert_eq!(full[3].prev_hash, "h3");
 }
 
-/// The two purge methods, previously untested. Both are named "before" and both must delete
-/// STRICTLY older rows while leaving the boundary row itself alone, and `purge_windows_before` must
-/// purge the ledger alongside the windows: purging only `usage_windows` would leave orphaned
-/// per-model token rows that no window row accounts for, growing forever.
+/// The two purge methods, previously untested, and they do NOT mean the same thing despite the
+/// symmetry of their names.
+///
+/// `purge_windows_before` is strictly-older: it must delete rows below the boundary and leave the
+/// boundary row itself alone, and it must take each window's per-model ledger rows with it, since
+/// ledger rows no window accounts for would grow forever.
+///
+/// `purge_metering_before` is NOT "before" at all despite the name: the trait defines it as "purge
+/// every row IN `bucket`", equality, because the metering table is durable billing evidence and the
+/// doc is explicit that this must never be wired to a sweeper. So this test seeds a SECOND, OLDER
+/// metering bucket that must SURVIVE. Without it, a single bucket makes `=`, `<` and `<=`
+/// indistinguishable, and widening the SQL to `<=` would silently destroy every older billing
+/// bucket on one operator purge with the test still green.
 #[test]
 fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
     let Some(url) = live_url() else { return };
@@ -1265,15 +1403,19 @@ fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
         pricing_version: String::new(),
     };
     let meter_bucket = 20_270_601u64;
+    let older_bucket = meter_bucket - 1;
     store.add_metering(&meter(meter_bucket)).unwrap();
-    assert!(
-        store
-            .list_metering(meter_bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == key_id),
-        "precondition: the metering row must exist before purging it"
-    );
+    store.add_metering(&meter(older_bucket)).unwrap();
+    for b in [meter_bucket, older_bucket] {
+        assert!(
+            store
+                .list_metering(b)
+                .unwrap()
+                .iter()
+                .any(|r| r.key_id == key_id),
+            "precondition: both metering rows must exist before the purge"
+        );
+    }
 
     let bad = store.purge_metering_before("not-a-number");
     assert!(
@@ -1300,6 +1442,21 @@ fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
             .any(|r| r.key_id == key_id),
         "the named metering bucket must be purged"
     );
+    // The discriminating half: an OLDER bucket must survive. Billing evidence is purged only for
+    // the bucket the operator named, so a `<=` or `<` in place of the `=` is a silent mass deletion
+    // that a single-bucket test cannot see.
+    assert!(
+        store
+            .list_metering(older_bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == key_id),
+        "purge_metering_before must purge ONLY the named bucket; an older billing bucket must \
+         survive it"
+    );
+    store
+        .purge_metering_before(&older_bucket.to_string())
+        .unwrap();
 
     let _ = store
         .lock()
@@ -1333,6 +1490,98 @@ fn list_keys_includes_tombstoned_rows() {
     );
 
     hard_reset(&store, &id);
+}
+
+/// `list_credentials_since` must actually return credentials. Its only previous appearance in this
+/// file was a NEGATIVE assertion (`all(|c| c.key_id != id)`), which `all()` satisfies vacuously on
+/// an empty vec, so deleting the whole method from the impl left the trait's `Ok(Vec::new())`
+/// default in place, kept the crate compiling, kept the suite green, and silently stopped every
+/// credential from ever reaching a hydrating node. This is also the only test that drives
+/// `CRED_SECRET_COLUMN_INDEX` against a real row on this path.
+#[test]
+fn list_credentials_since_returns_new_credentials_with_their_secret() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_cred_since_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+
+    let watermark = store.get_key(&id).unwrap().unwrap().revision;
+    let public_id = format!("AKIA_SINCE_{}", unique_suffix());
+    let cred = sample_cred(&id, 0, &public_id);
+    store.put_credential(&cred).unwrap();
+
+    let deltas = store.list_credentials_since(watermark).unwrap();
+    let ours = deltas
+        .iter()
+        .find(|c| c.meta.key_id == id)
+        .expect("a credential minted after the watermark must appear in the delta");
+    assert_eq!(ours.meta.public_id, public_id);
+    assert_eq!(
+        ours.secret, cred.secret,
+        "the delta must carry the secret material: hydration on a sibling node has no other source \
+         for it, and a wrong column index here reads back empty rather than failing"
+    );
+    assert!(
+        ours.meta.revision > watermark,
+        "the delta row must carry a revision above the watermark that selected it"
+    );
+
+    // And the watermark must exclude what it has already seen.
+    let after = store.list_credentials_since(ours.meta.revision).unwrap();
+    assert!(
+        !after.iter().any(|c| c.meta.key_id == id),
+        "a credential at or below the watermark must not be returned again"
+    );
+
+    hard_reset(&store, &id);
+}
+
+/// `put_credential_tx`'s SECOND failure branch: the slot is free, so the guarded upsert is not what
+/// blocked the write, and the insert was rejected by the cross-key `UNIQUE (kind, public_id)`
+/// constraint instead. Only the first branch (an occupied LIVE slot) had a test, so this arm's
+/// `changed == 0` handling could have returned Ok and reported a mint that never happened.
+#[test]
+fn put_credential_rejects_a_public_id_already_used_by_another_key() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id_a = format!("vk_pubid_a_{}", unique_suffix());
+    let id_b = format!("vk_pubid_b_{}", unique_suffix());
+    hard_reset(&store, &id_a);
+    hard_reset(&store, &id_b);
+    store.put_key(&sample_key(&id_a)).unwrap();
+    store.put_key(&sample_key(&id_b)).unwrap();
+
+    let public_id = format!("AKIA_SHARED_{}", unique_suffix());
+    store
+        .put_credential(&sample_cred(&id_a, 0, &public_id))
+        .unwrap();
+
+    // Same public_id, DIFFERENT key, free slot. The slot guard cannot catch this; the unique
+    // constraint does, and the store must surface it rather than report a successful mint.
+    let mut clash = sample_cred(&id_b, 0, &public_id);
+    clash.meta.id = format!("cred_clash_{}", unique_suffix());
+    let err = store
+        .put_credential(&clash)
+        .expect_err("minting a credential whose public_id is already in use must fail");
+    assert!(
+        err.0.contains("public_id"),
+        "the error should name the constraint that rejected the mint: {}",
+        err.0
+    );
+    assert!(
+        store.list_credentials(&id_b).unwrap().is_empty(),
+        "the rejected mint must leave no row behind on the second key"
+    );
+    // And the original credential must be untouched and still resolvable.
+    let original = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .expect("the first key's credential must survive the rejected clash");
+    assert_eq!(original.meta.key_id, id_a);
+
+    hard_reset(&store, &id_a);
+    hard_reset(&store, &id_b);
 }
 
 /// A unique-enough suffix (pid + nanos) for names that must not collide across concurrently
@@ -1388,6 +1637,56 @@ fn drop_database(url: &str, db_name: &str) {
     }
 }
 
+/// A disposable database that removes itself on drop, INCLUDING when a panic unwinds partway
+/// through the test. Cleanup written as a trailing statement never runs on the failure path, so
+/// every red run used to leak a fully migrated database (and, for the permission test, a
+/// CLUSTER-WIDE login role) onto the shared server, forever, under a pid+nanos name nothing would
+/// ever reclaim.
+struct TempDb {
+    admin_url: String,
+    name: String,
+    /// Cluster-scoped roles outlive the database they were used in, so they need dropping too, and
+    /// `DROP OWNED BY` must run while the database still exists.
+    role: Option<String>,
+}
+
+impl TempDb {
+    fn create(admin_url: &str, prefix: &str) -> Self {
+        let name = format!("{prefix}_{}", unique_suffix());
+        create_fresh_database(admin_url, &name);
+        Self {
+            admin_url: admin_url.to_string(),
+            name,
+            role: None,
+        }
+    }
+
+    fn url(&self) -> String {
+        isolated_db_url(&self.admin_url, &self.name)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn owns_role(&mut self, role: &str) {
+        self.role = Some(role.to_string());
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        if let Some(role) = &self.role {
+            if let Ok(mut c) = postgres::Client::connect(&self.url(), postgres::NoTls) {
+                let _ = c.batch_execute(&format!(
+                    "DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"
+                ));
+            }
+        }
+        drop_database(&self.admin_url, &self.name);
+    }
+}
+
 /// `migrate_locked`'s undefined-table bootstrap path AND its legacy-table drop, together, on a
 /// genuinely fresh (separate, disposable) database rather than the shared test database -- which,
 /// once any test has run against it, never again presents an undefined `busbar_schema` or a
@@ -1396,9 +1695,8 @@ fn drop_database(url: &str, db_name: &str) {
 #[test]
 fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
     let Some(url) = live_url() else { return };
-    let db = format!("spg_fresh_{}", unique_suffix());
-    create_fresh_database(&url, &db);
-    let iso_url = isolated_db_url(&url, &db);
+    let tmp = TempDb::create(&url, "spg_fresh");
+    let iso_url = tmp.url();
 
     {
         let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
@@ -1429,7 +1727,6 @@ fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
 
     drop(store);
     drop(check);
-    drop_database(&url, &db);
 }
 
 /// The mirror image of the test above: a database ALREADY at `SCHEMA_VERSION` must skip the
@@ -1441,9 +1738,8 @@ fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
 #[test]
 fn migrate_already_at_current_version_skips_the_legacy_check() {
     let Some(url) = live_url() else { return };
-    let db = format!("spg_atver_{}", unique_suffix());
-    create_fresh_database(&url, &db);
-    let iso_url = isolated_db_url(&url, &db);
+    let tmp = TempDb::create(&url, "spg_atver");
+    let iso_url = tmp.url();
 
     {
         let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
@@ -1469,7 +1765,6 @@ fn migrate_already_at_current_version_skips_the_legacy_check() {
 
     drop(store);
     drop(check);
-    drop_database(&url, &db);
 }
 
 /// The v6 one-time backfill: a database sitting at v5 with a `usage_windows` row shaped
@@ -1479,9 +1774,8 @@ fn migrate_already_at_current_version_skips_the_legacy_check() {
 #[test]
 fn migrate_v6_backfills_billable_requests_for_a_pre_migration_row() {
     let Some(url) = live_url() else { return };
-    let db = format!("spg_v6backfill_{}", unique_suffix());
-    create_fresh_database(&url, &db);
-    let iso_url = isolated_db_url(&url, &db);
+    let tmp = TempDb::create(&url, "spg_v6backfill");
+    let iso_url = tmp.url();
 
     {
         let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
@@ -1523,7 +1817,6 @@ fn migrate_v6_backfills_billable_requests_for_a_pre_migration_row() {
 
     drop(store);
     drop(check);
-    drop_database(&url, &db);
 }
 
 /// The other half: a database ALREADY at v6+ must NOT have this backfill re-applied — a row
@@ -1533,9 +1826,8 @@ fn migrate_v6_backfills_billable_requests_for_a_pre_migration_row() {
 #[test]
 fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
     let Some(url) = live_url() else { return };
-    let db = format!("spg_v6norerun_{}", unique_suffix());
-    create_fresh_database(&url, &db);
-    let iso_url = isolated_db_url(&url, &db);
+    let tmp = TempDb::create(&url, "spg_v6norerun");
+    let iso_url = tmp.url();
 
     {
         let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
@@ -1573,7 +1865,6 @@ fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
 
     drop(store);
     drop(check);
-    drop_database(&url, &db);
 }
 
 /// `migrate`/`migrate_locked` must never silently succeed against a role that lacks real read
@@ -1596,10 +1887,14 @@ fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
 #[test]
 fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
     let Some(url) = live_url() else { return };
-    let db = format!("spg_perm_{}", unique_suffix());
-    create_fresh_database(&url, &db);
-    let iso_url = isolated_db_url(&url, &db);
+    let mut tmp = TempDb::create(&url, "spg_perm");
+    let iso_url = tmp.url();
     let role = format!("spg_limited_{}", unique_suffix());
+    // Roles are CLUSTER-scoped, so they outlive the database and outlive a failed run. Handing
+    // ownership to the guard is what makes the drop happen on the panic path too; as a trailing
+    // statement it only ever ran when the test passed, and a leaked LOGIN role persists in
+    // pg_authid for every later step in the job.
+    tmp.owns_role(&role);
 
     {
         let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
@@ -1613,7 +1908,7 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
         // Deliberately NO SELECT grant on busbar_schema.
     }
 
-    let limited_url = role_url(&url, &db, &role, "limited");
+    let limited_url = role_url(&url, tmp.name(), &role, "limited");
 
     // Sanity-check the fixture itself, independently (raw client, never through the store): the
     // probe query must fail with insufficient_privilege, never undefined_table, or this test would
@@ -1637,11 +1932,4 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
         "migrate must never silently succeed against a role that can't actually read its own \
          bookkeeping table"
     );
-
-    let mut cleanup = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let _ = cleanup.batch_execute(&format!(
-        "DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"
-    ));
-    drop(cleanup);
-    drop_database(&url, &db);
 }
