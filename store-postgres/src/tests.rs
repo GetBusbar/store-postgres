@@ -2022,3 +2022,81 @@ mod conformance {
         conf::assert_append_audit_duplicate_seq(&store, seq);
     }
 }
+
+/// `append_audit` must never report success for a record it did not store.
+///
+/// The duplicate-seq comparison added earlier read the stored row on a SEPARATE autocommit
+/// connection after the INSERT. If the conflicting row was deleted in between (an out-of-band
+/// retention job, operator SQL), the read found nothing, and the obvious-looking answer -- "no row,
+/// so no fork, so Ok" -- reported success while the seq held nothing and the incoming record had
+/// never been written. That is the same silent-loss shape the comparison exists to prevent, just
+/// inverted, and an audit entry is the last thing that should vanish quietly.
+///
+/// Simulated the way the audit that found it did: a statement-level AFTER INSERT trigger that
+/// deletes the conflicting row, so the read-back always loses the row. The append must then either
+/// succeed with the record actually present, or fail -- never Ok with nothing stored.
+#[test]
+fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let seq = 920_000_000u64 + (std::process::id() as u64 % 1_000_000);
+
+    let entry = AuditRecord {
+        seq,
+        ts: 1_700_000_000,
+        action: "hook.register".into(),
+        resource: "hook:vanish".into(),
+        outcome: "applied".into(),
+        principal: "admin".into(),
+        prev_hash: String::new(),
+        hash: "h-vanish".into(),
+    };
+
+    // Seed the row that will collide, then arm a trigger that deletes whatever occupies this seq
+    // after any insert -- reproducing "the conflicting row disappeared underneath the read-back".
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)])
+        .unwrap();
+    store.append_audit(&entry).expect("seed the colliding row");
+    let fn_name = format!("busbar_vanish_{}", std::process::id());
+    let trg_name = format!("busbar_vanish_trg_{}", std::process::id());
+    client
+        .batch_execute(&format!(
+            "CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
+             BEGIN DELETE FROM audit_log WHERE seq = {}; RETURN NULL; END; $$ LANGUAGE plpgsql;
+             CREATE TRIGGER {trg_name} AFTER INSERT ON audit_log
+             FOR EACH STATEMENT EXECUTE FUNCTION {fn_name}();",
+            clamp(seq)
+        ))
+        .unwrap();
+
+    let mut forked = entry.clone();
+    forked.action = "hook.remove".into();
+    forked.hash = "h-forked".into();
+    let result = store.append_audit(&forked);
+
+    // Disarm before asserting, so a failed assertion cannot leave the trigger behind for other
+    // concurrently running tests.
+    client
+        .batch_execute(&format!(
+            "DROP TRIGGER IF EXISTS {trg_name} ON audit_log; DROP FUNCTION IF EXISTS {fn_name}();"
+        ))
+        .unwrap();
+
+    if result.is_ok() {
+        // Ok is only honest if the record is actually there.
+        let present: i64 = client
+            .query_one(
+                "SELECT count(*) FROM audit_log WHERE seq=$1 AND action=$2",
+                &[&clamp(seq), &forked.action],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            present, 1,
+            "append_audit returned Ok but the record is not stored -- a silently lost audit entry"
+        );
+    }
+    let _ = client.execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+}

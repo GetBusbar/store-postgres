@@ -1211,6 +1211,20 @@ impl Store for PostgresStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
+        // read back is NOT the record written. Two consequences, both bad, and neither acceptable
+        // silently — an identical retry compares unequal and is reported as "the audit chain has
+        // forked" (naming the same action on both sides, the worst possible page to hand an
+        // operator), and two genuinely distinct seqs collapse onto one row. Rejected outright
+        // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
+        // which is the wrong half to give up.
+        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
+            return Err(StoreError(format!(
+                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
+                 store a record that would not read back as itself",
+                entry.seq, entry.ts
+            )));
+        }
         let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
         // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
         // never rewrites or recomputes the digest" (busbar_api::Store::append_audit doc). `seq` is a
@@ -1220,54 +1234,82 @@ impl Store for PostgresStore {
         // without any trace. Failing loudly on a collision is strictly safer than the alternative:
         // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
         // integrity guarantees it claims to hold.
-        let inserted = self
-            .lock()
-            .execute(
-                "INSERT INTO audit_log
-                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (seq) DO NOTHING",
-                &[
-                    &seq,
-                    &ts,
-                    &entry.action,
-                    &entry.resource,
-                    &entry.outcome,
-                    &entry.principal,
-                    &entry.prev_hash,
-                    &entry.hash,
-                ],
-            )
-            .store()?;
-        if inserted == 0 {
-            // A collision has TWO causes and they are not the same event. Erroring on both (which
-            // this used to do) makes the engine's own write-through look like a corrupt chain the
-            // first time a commit ACK is lost to a timeout or a reconnect and it retries. Compare
-            // the records and let the difference decide, per the trait contract:
-            //   identical -> the retry. Benign, and the common one. Ok.
-            //   different -> two records claiming one chain position: forked or tampered. Error.
-            let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1");
-            let stored = self
-                .lock()
+        // A collision has TWO causes and they are not the same event. Erroring on both (which this
+        // used to do) makes the engine's own write-through look like a corrupt chain the first time
+        // a commit ACK is lost to a timeout or a reconnect and it retries. Compare the records and
+        // let the difference decide, per the trait contract:
+        //   identical -> the retry. Benign, and the common one. Ok.
+        //   different -> two records claiming one chain position: forked or tampered. Error.
+        //
+        // The INSERT and the read-back run in ONE transaction, and the read takes `FOR SHARE`, so
+        // the row that caused the conflict cannot be deleted out from under the comparison. Without
+        // that (an autocommit INSERT then a separate autocommit SELECT), an out-of-band deleter —
+        // operator SQL, an external retention job — could remove the conflicting row in between,
+        // leaving the seq empty and this method with nothing to compare. The obvious-looking answer
+        // there, "nothing occupies the seq, so no fork: return Ok", REPORTS SUCCESS FOR A RECORD IT
+        // NEVER STORED. That is the same silent-loss shape the whole comparison exists to prevent,
+        // just inverted, and an audit entry is the last thing that should vanish quietly.
+        //
+        // The loop covers the one case the lock cannot: the row disappearing BEFORE the read takes
+        // its share lock. Then the seq is genuinely free again and the right move is to insert,
+        // which is what the next iteration does. Bounded, and exhausting the bound is an error
+        // rather than a success, so no path here returns Ok without the record being stored.
+        const MAX_ATTEMPTS: u32 = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut client = self.lock();
+            let mut tx = client.transaction().store()?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO audit_log
+                        (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                     ON CONFLICT (seq) DO NOTHING",
+                    &[
+                        &seq,
+                        &ts,
+                        &entry.action,
+                        &entry.resource,
+                        &entry.outcome,
+                        &entry.principal,
+                        &entry.prev_hash,
+                        &entry.hash,
+                    ],
+                )
+                .store()?;
+            if inserted == 1 {
+                tx.commit().store()?;
+                return Ok(());
+            }
+            let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
+            let stored = tx
                 .query_opt(&sql, &[&seq])
                 .store()?
                 .map(|r| row_to_audit(&r));
             match stored {
-                // Gone between the INSERT and this read (a concurrent purge). Nothing occupies the
-                // seq now, so there is no fork to report and no record to keep; treating it as a
-                // benign no-op is the only answer that is not an invented failure.
-                None => return Ok(()),
-                Some(stored) if &stored == entry => return Ok(()),
+                Some(stored) if &stored == entry => {
+                    tx.commit().store()?;
+                    return Ok(());
+                }
                 Some(stored) => {
                     return Err(StoreError(format!(
                         "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
                          has forked (stored action '{}', incoming '{}')",
                         entry.seq, stored.action, entry.action
-                    )))
+                    )));
+                }
+                // Gone before the share lock could hold it. Drop the transaction and try again:
+                // the seq is free, so the insert should now land.
+                None => {
+                    drop(tx);
                 }
             }
         }
-        Ok(())
+        Err(StoreError(format!(
+            "append_audit: seq {} kept being freed between the insert and the read-back after \
+             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
+             was NOT stored",
+            entry.seq
+        )))
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
