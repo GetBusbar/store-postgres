@@ -43,15 +43,21 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
 - **A shared, multi-node governance store.** `store: sqlite` is
   per-node; `store: postgres` puts virtual keys, budgets, and usage
   behind one database so a fleet of busbar nodes agrees on state.
-- **Drop-in interchangeable with the SQLite backend at the `Store`
-  trait**, which is the boundary busbar actually depends on: the same
-  keys, credentials, tombstone and revision semantics, and the same
-  JSON encoding of `allowed_pools`. The physical tables are NOT
-  identical: Postgres keeps per-model token counters in their own
-  `usage_ledger` table, where SQLite folds them into `usage_windows`
-  with `model` in the primary key. Write reporting queries and ETL
-  against the backend you are actually running, never against the
-  assumption that the two are byte-identical.
+- **Interchangeable with the SQLite backend for everything busbar
+  itself does**: the same keys, credentials, tombstone and revision
+  semantics, and the same JSON encoding of `allowed_pools`. Two caveats
+  worth knowing before you write anything against it directly.
+- **The physical tables differ.** Postgres keeps per-model token
+  counters in their own `usage_ledger` table, where SQLite folds them
+  into `usage_windows` with `model` in the primary key. Write reporting
+  queries and ETL against the backend you are actually running, never
+  against the assumption that the two are byte-identical.
+- **A few error cases differ across backends.** Revoking a credential
+  id that names no row is an error here and on MySQL, and a silent
+  success on SQLite and Valkey. Appending an audit entry whose `seq`
+  already exists is an error here, where the other backends overwrite
+  or ignore. Tooling that treats a store error as fatal should not
+  assume the same input produces the same outcome on every backend.
 
 ## Known limitations (documented honestly, not papered over)
 

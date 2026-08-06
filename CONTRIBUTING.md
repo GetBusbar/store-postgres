@@ -13,7 +13,9 @@ how to build, test, and submit changes.
 
 ## Development setup
 
-`store-postgres` is a Rust `cdylib` plugin. You need a recent stable toolchain
+This repo is a 2-crate Rust workspace: `store-postgres/` is the library crate
+holding the store logic, and `store-postgres-plugin/` is the `cdylib` the engine
+loads. You need a recent stable toolchain
 (`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
 ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
@@ -38,9 +40,11 @@ cargo fmt --all -- --check                   # format before committing
 
 1. **`cargo fmt --all`** — code must be rustfmt-clean.
 2. **`cargo clippy --all-targets -- -D warnings`** — no warnings.
-3. **`cargo build && cargo test`** — green, including the live-Postgres
-   end-to-end test in `tests/e2e.rs` (it hard-fails under `CI=1` rather than
-   silently skipping — never let that coverage quietly vanish).
+3. **`cargo build && cargo test`** — green, including the live-Postgres suites
+   in `store-postgres/src/tests.rs`, `store-postgres-plugin/tests/e2e.rs` and
+   `store-postgres-plugin/tests/admin_api_e2e.rs`. They hard-fail under `CI`
+   rather than silently skipping. Never let that coverage quietly vanish: point
+   `BUSBAR_TEST_POSTGRES_URL` at a real database before trusting a local green.
 4. Add or update tests for any behavior change.
 5. Update documentation (`README.md`, doc comments) when you change behavior or config.
 
