@@ -2061,13 +2061,21 @@ fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
     store.append_audit(&entry).expect("seed the colliding row");
     let fn_name = format!("busbar_vanish_{}", std::process::id());
     let trg_name = format!("busbar_vanish_trg_{}", std::process::id());
+    // FOR EACH ROW with a WHEN clause pinned to THIS test's seq, not FOR EACH STATEMENT.
+    //
+    // A statement-level trigger fires on every insert into `audit_log` by anyone. While armed, a
+    // concurrently running sibling test appending its own audit row deleted THIS test's seeded row,
+    // so the forked append below found the seq free, inserted, had its own row deleted by the
+    // trigger, and returned Ok with nothing stored -- the test then failed against a scenario it
+    // never meant to create, 8 runs in 22. Row-level plus `WHEN (NEW.seq = ...)` makes the trigger
+    // inert for every insert except this test's own.
     client
         .batch_execute(&format!(
             "CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
-             BEGIN DELETE FROM audit_log WHERE seq = {}; RETURN NULL; END; $$ LANGUAGE plpgsql;
+             BEGIN DELETE FROM audit_log WHERE seq = {seq_lit}; RETURN NULL; END; $$ LANGUAGE plpgsql;
              CREATE TRIGGER {trg_name} AFTER INSERT ON audit_log
-             FOR EACH STATEMENT EXECUTE FUNCTION {fn_name}();",
-            clamp(seq)
+             FOR EACH ROW WHEN (NEW.seq = {seq_lit}) EXECUTE FUNCTION {fn_name}();",
+            seq_lit = clamp(seq)
         ))
         .unwrap();
 
