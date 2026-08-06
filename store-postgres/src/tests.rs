@@ -22,7 +22,7 @@ fn cred_secret_column_index_matches_cred_meta_columns_count() {
     );
 }
 
-/// L2: a connect-error string must never leak the DSN password.
+/// A connect-error string must never leak the DSN password.
 #[test]
 fn dsn_password_extraction_and_scrub() {
     assert_eq!(
@@ -164,7 +164,7 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 }
 
 /// Basic key round-trip, including the new fields (generation_hash, expires_at, deleted_at,
-/// revision) and the C6 allowed_pools NULL-vs-'[]' distinction.
+/// revision) and the allowed_pools NULL-vs-'[]' distinction.
 #[test]
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
@@ -240,6 +240,39 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
     assert_eq!(
         after2.deleted_at, deleted_at_first,
         "a repeat delete must not change deleted_at"
+    );
+}
+
+/// `delete_key` must stamp `deleted_at` with a WALL-CLOCK time, not with the store-global revision
+/// counter. The two are both BIGINTs bound in the same statement, so binding the revision to both
+/// `deleted_at` and `revision` type-checks, round-trips, and satisfies every "is the key
+/// tombstoned" assertion elsewhere in this file -- while reporting that every key in the store was
+/// deleted a few seconds after the epoch. Bracketing the call with real clock reads is the only
+/// assertion that can tell the two apart: a revision counter is a small integer and can never fall
+/// inside a window of the current Unix time.
+#[test]
+fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = "vk_deleted_at_clock1";
+    hard_reset(&store, id);
+    store.put_key(&sample_key(id)).unwrap();
+
+    let before = now_secs();
+    store.delete_key(id).unwrap();
+    let after = now_secs();
+
+    let deleted_at = store
+        .get_key(id)
+        .unwrap()
+        .unwrap()
+        .deleted_at
+        .expect("delete_key must set deleted_at");
+    assert!(
+        deleted_at >= before && deleted_at <= after,
+        "deleted_at must be the wall-clock second the delete landed (expected {before}..={after}), \
+         got {deleted_at} -- a value far below the current Unix time means the revision counter was \
+         bound to this column instead of a clock read"
     );
 }
 
@@ -431,19 +464,67 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
         "the OTHER slot's credential must be untouched"
     );
 
+    // The VERIFY path, not just the admin listing: `lookup_credential_secret` still resolves the
+    // row (the trait reserves `None` for an unknown `(kind, public_id)` pair, so hiding a revoked
+    // row here would make a revoked secret indistinguishable from a typo'd one), which is exactly
+    // why the revocation has to be visible ON the row it returns. Asserted as a positive fact about
+    // what the verify path hands back: an `is_none() || !is_live()` disjunction cannot fail once
+    // `revoked_at.is_some()` has been asserted above, so it would pass no matter what this lookup
+    // returned.
+    let resolved = store
+        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_A")
+        .unwrap()
+        .expect("the verify path must still resolve a revoked credential, not report it unknown");
     assert!(
-        store
-            .lookup_credential_secret("sigv4", "AKIA_REVOKE1_A")
-            .unwrap()
-            .is_none()
-            || !meta0.is_live(0),
-        "a revoked credential must no longer resolve as live"
+        resolved.meta.revoked_at.is_some(),
+        "the credential the verify path resolves must carry the revocation, or every caller's \
+         liveness check admits a revoked secret"
+    );
+    assert!(
+        !resolved.meta.is_live(0),
+        "a revoked credential must never read as live on the verify path"
     );
 
     // Idempotent.
     store
         .revoke_credential(&c0.meta.id, "leaked again")
         .unwrap();
+}
+
+/// `revoke_credential` must FAIL LOUD on a credential id that does not exist, rather than reporting
+/// a successful revocation of nothing. The trait's own doc defaults this method to a loud error
+/// precisely because "a silent no-op here would let an operator believe a leaked SigV4 secret was
+/// killed when it was not"; the idempotency it also promises is about an ALREADY-REVOKED row, which
+/// the second half of this test pins as still being a no-op success.
+///
+/// The unknown-id case is reachable in ordinary operation, not just from a typo: minting into a
+/// revoked slot rewrites that row's primary key (`id=EXCLUDED.id`), so an id handed out by an
+/// earlier `list_credentials` can stop naming any row while a caller is still working through the
+/// list.
+#[test]
+fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_one() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = "vk_revoke_unknown1";
+    hard_reset(&store, id);
+    store.put_key(&sample_key(id)).unwrap();
+
+    let err = store
+        .revoke_credential("cred_this_id_was_never_minted", "leaked")
+        .expect_err("revoking an id that names no row must be an error, not a reported success");
+    assert!(
+        err.0.contains("cred_this_id_was_never_minted"),
+        "the error should name the id that could not be revoked: {}",
+        err.0
+    );
+
+    // The idempotent half: a real credential revoked twice succeeds both times.
+    let cred = sample_cred(id, 0, "AKIA_REVOKE_UNKNOWN1");
+    store.put_credential(&cred).unwrap();
+    store.revoke_credential(&cred.meta.id, "leaked").unwrap();
+    store
+        .revoke_credential(&cred.meta.id, "leaked again")
+        .expect("re-revoking an already-revoked credential must stay a no-op success");
 }
 
 /// HYDRATION-DELTA SOUNDNESS, the same invariant the SQLite and MySQL schemas have to hold. A
@@ -1001,6 +1082,257 @@ fn append_audit_is_append_only_and_rejects_a_seq_collision() {
     let _ = store
         .lock()
         .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+}
+
+/// The denylist pair, previously untested in either direction. `add_denylist` is an UPSERT whose
+/// `DO UPDATE SET reason` half is the part that can silently rot: downgrading it to `DO NOTHING`
+/// keeps every "is this subject denied" check passing while quietly pinning the reason to whatever
+/// the first call said, so a re-denylist with a corrected reason reports success and changes
+/// nothing.
+#[test]
+fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let sub = format!("sub_denylist_{}", unique_suffix());
+    let _ = store
+        .lock()
+        .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
+
+    store.add_denylist(&sub, "first reason").unwrap();
+    assert!(
+        store.list_denylist().unwrap().contains(&sub),
+        "an added subject must appear in list_denylist"
+    );
+
+    store.add_denylist(&sub, "corrected reason").unwrap();
+    let stored_reason: String = store
+        .lock()
+        .query_one("SELECT reason FROM denylist WHERE sub=$1", &[&sub])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        stored_reason, "corrected reason",
+        "re-denylisting a subject must update the recorded reason, not silently keep the old one"
+    );
+    let occurrences = store
+        .list_denylist()
+        .unwrap()
+        .iter()
+        .filter(|s| *s == &sub)
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "a repeat add must not duplicate the subject"
+    );
+
+    let _ = store
+        .lock()
+        .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
+}
+
+/// `list_audit_tail` must return the tail OLDEST FIRST. It queries `ORDER BY seq DESC LIMIT n` and
+/// reverses in Rust, so dropping the reverse still returns the right n entries, still passes any
+/// set-membership assertion, and hands every hash-chain verifier the chain backwards. Ordering is
+/// the only assertion that can see it.
+#[test]
+fn list_audit_tail_returns_the_newest_entries_oldest_first() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    // A high, unique seq block so this cannot collide with a concurrently running test's entries.
+    let base = 800_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
+    for offset in 0..4u64 {
+        let _ = store.lock().execute(
+            "DELETE FROM audit_log WHERE seq=$1",
+            &[&clamp(base + offset)],
+        );
+    }
+    for offset in 0..4u64 {
+        store
+            .append_audit(&AuditRecord {
+                seq: base + offset,
+                ts: 1_700_000_000 + offset,
+                action: "key.mint".into(),
+                resource: format!("key:{offset}"),
+                outcome: "applied".into(),
+                principal: "vk_tail_test".into(),
+                prev_hash: format!("h{}", offset.saturating_sub(1)),
+                hash: format!("h{offset}"),
+            })
+            .unwrap();
+    }
+
+    let tail = store.list_audit_tail(3).unwrap();
+    let ours: Vec<u64> = tail
+        .iter()
+        .map(|r| r.seq)
+        .filter(|s| *s >= base && *s < base + 4)
+        .collect();
+    assert_eq!(
+        ours,
+        vec![base + 1, base + 2, base + 3],
+        "list_audit_tail must return the NEWEST entries in OLDEST-FIRST order, so a hash-chain \
+         verifier reads prev_hash -> hash forwards"
+    );
+
+    for offset in 0..4u64 {
+        let _ = store.lock().execute(
+            "DELETE FROM audit_log WHERE seq=$1",
+            &[&clamp(base + offset)],
+        );
+    }
+}
+
+/// The two purge methods, previously untested. Both are named "before" and both must delete
+/// STRICTLY older rows while leaving the boundary row itself alone, and `purge_windows_before` must
+/// purge the ledger alongside the windows: purging only `usage_windows` would leave orphaned
+/// per-model token rows that no window row accounts for, growing forever.
+#[test]
+fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let bucket = format!("vk_purge_{}", unique_suffix());
+    let old_ws = 1_000u64;
+    let boundary = 2_000u64;
+
+    let ledger = |model: &str| UsageLedger {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokens {
+            model: model.into(),
+            tokens: TierTokens {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        }],
+    };
+    store
+        .put_usage(&bucket, old_ws, &ledger("old-model"))
+        .unwrap();
+    store
+        .put_usage(&bucket, boundary, &ledger("boundary-model"))
+        .unwrap();
+
+    let purged = store.purge_windows_before(boundary).unwrap();
+    assert!(
+        purged >= 1,
+        "the strictly-older window must be reported as purged, got {purged}"
+    );
+    assert_eq!(
+        store.get_usage(&bucket, old_ws).unwrap().requests,
+        0,
+        "a window older than the boundary must be gone"
+    );
+    let kept = store.get_usage(&bucket, boundary).unwrap();
+    assert_eq!(
+        kept.requests, 1,
+        "the boundary window itself must survive: the contract is strictly-before, not at-or-before"
+    );
+    assert_eq!(
+        kept.models.len(),
+        1,
+        "the boundary window's ledger rows must survive alongside it"
+    );
+    let orphaned: i64 = store
+        .lock()
+        .query_one(
+            "SELECT COUNT(*) FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &clamp(old_ws)],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        orphaned, 0,
+        "purging a window must purge its per-model ledger rows too, or they orphan and grow forever"
+    );
+
+    // usage_metering, whose boundary parameter is a STRING on this trait method while every other
+    // metering method takes it as u64. The parse is the only caller-supplied parse in the crate.
+    let key_id = format!("vk_purge_meter_{}", unique_suffix());
+    let meter = |bucket: u64| busbar_api::MeteringDelta {
+        key_id: key_id.clone(),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+    };
+    let meter_bucket = 20_270_601u64;
+    store.add_metering(&meter(meter_bucket)).unwrap();
+    assert!(
+        store
+            .list_metering(meter_bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == key_id),
+        "precondition: the metering row must exist before purging it"
+    );
+
+    let bad = store.purge_metering_before("not-a-number");
+    assert!(
+        bad.is_err(),
+        "a non-integer bucket must be a loud error, never a silent no-op reported as a purge"
+    );
+    assert!(
+        store
+            .list_metering(meter_bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == key_id),
+        "a rejected purge must not have deleted anything"
+    );
+
+    store
+        .purge_metering_before(&meter_bucket.to_string())
+        .unwrap();
+    assert!(
+        !store
+            .list_metering(meter_bucket)
+            .unwrap()
+            .iter()
+            .any(|r| r.key_id == key_id),
+        "the named metering bucket must be purged"
+    );
+
+    let _ = store
+        .lock()
+        .execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&bucket]);
+    let _ = store
+        .lock()
+        .execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&bucket]);
+}
+
+/// `list_keys` is deliberately UNFILTERED: it must include tombstoned rows, because
+/// `list_keys_since`'s fallback consumers need the tombstone visible to drive credential eviction.
+/// Adding the intuitively-correct-looking `WHERE deleted_at IS NULL` would silently break that, and
+/// nothing else in this suite would notice.
+#[test]
+fn list_keys_includes_tombstoned_rows() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_list_tombstoned_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+    store.delete_key(&id).unwrap();
+
+    let listed = store.list_keys().unwrap();
+    let found = listed
+        .iter()
+        .find(|k| k.id == id)
+        .expect("list_keys must include a tombstoned key, not filter it out");
+    assert!(
+        !found.is_live(),
+        "the listed row must be the tombstone itself"
+    );
+
+    hard_reset(&store, &id);
 }
 
 /// A unique-enough suffix (pid + nanos) for names that must not collide across concurrently

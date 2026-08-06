@@ -56,12 +56,13 @@ impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
 
 /// True when a postgres error is SQLSTATE 42P01 (`undefined_table`) - the ONE case migrate() treats
 /// as an unversioned (version 0) database. Every other error class (connection, timeout, permission)
-/// is transient/fatal and must never be read as "fresh DB". See migrate()'s H1 note.
+/// is transient/fatal and must never be read as "fresh DB": treating a connection or permission
+/// failure as version 0 would drop and recreate a populated database.
 fn is_undefined_table(e: &postgres::Error) -> bool {
     e.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
-/// Extract the PASSWORD from a Postgres DSN (L2). Supports both the URL form
+/// Extract the PASSWORD from a Postgres DSN. Supports both the URL form
 /// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
 /// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
 fn dsn_password(dsn: &str) -> Option<String> {
@@ -160,7 +161,7 @@ CREATE TABLE IF NOT EXISTS keys (
     generation_hash TEXT NOT NULL,
     name            TEXT NOT NULL,
     -- NULL = the pool grant was OMITTED at mint = ALL pools; a JSON array (possibly empty) = the
-    -- exhaustive grant (C6: NULL and '[]' must never collapse into each other).
+    -- exhaustive grant. NULL and '[]' must never collapse into each other.
     allowed_pools   TEXT,
     enabled         BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      BIGINT NOT NULL,
@@ -264,6 +265,18 @@ fn clamp(v: u64) -> i64 {
 /// wrapping via `as`.
 fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
+}
+
+/// Current Unix time in seconds, 0 if the system clock is before the epoch. The ONE source of
+/// wall-clock stamps in this crate (`deleted_at`, `revoked_at`), so no write path can reach for a
+/// convenient nearby integer instead: `revision` is also a BIGINT and binding it to a timestamp
+/// column type-checks, round-trips, and satisfies every "is it set" assertion while recording a
+/// time a few seconds after 1970.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl PostgresStore {
@@ -471,9 +484,11 @@ const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,creat
 /// exactly the column COUNT of CRED_META_COLUMNS (12: id,key_id,kind,slot,public_id,secret_form,
 /// created_at,updated_at,expires_at,revoked_at,revoke_reason,revision -- indices 0-11), since every
 /// query that reads `secret` builds its SELECT by appending it right after that column list. Named
-/// here instead of a bare `12` at each call site; `debug_assert!` below catches drift if
-/// CRED_META_COLUMNS' column count ever changes without updating this constant to match, since
-/// `str::split` isn't const-evaluable in stable Rust.
+/// here instead of a bare `12` at each call site. The drift guard is a test, not an inline
+/// assertion: `cred_secret_column_index_matches_cred_meta_columns_count` in this crate's `tests`
+/// module fails if CRED_META_COLUMNS' column count ever changes without this constant being
+/// updated to match, which is as close as stable Rust gets while `str::split` is not
+/// const-evaluable.
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
 fn row_to_cred_meta(r: &Row) -> CredentialMeta {
@@ -577,6 +592,13 @@ impl Store for PostgresStore {
             Some(false) => {}
         }
         let rev = Self::next_revision(&mut tx)?;
+        // `deleted_at` is a WALL-CLOCK stamp and `revision` is the store-global counter. They are
+        // both BIGINT, so binding one value to both columns compiles, round-trips and satisfies
+        // every "is this key tombstoned" check -- while telling every operator, retention job and
+        // cross-backend comparison that the key was deleted a few seconds after 1970. Bound
+        // separately, and pinned by
+        // `delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision`.
+        let now = clamp(now_secs());
         tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
             .store()?;
         // `AND deleted_at IS NULL` re-states the guard the SELECT above already checked, IN the
@@ -589,7 +611,7 @@ impl Store for PostgresStore {
             .execute(
                 "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
                  WHERE id=$1 AND deleted_at IS NULL",
-                &[&id, &rev, &rev],
+                &[&id, &now, &rev],
             )
             .store()?;
         // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
@@ -982,15 +1004,19 @@ impl Store for PostgresStore {
             .store()?
             .get(0);
         if !exists {
-            // Idempotent per the trait doc.
-            tx.commit().store()?;
-            return Ok(());
+            // NOT idempotent-success: the trait's idempotency covers an ALREADY-REVOKED row, and it
+            // defaults this method to a loud error because a silent no-op lets an operator believe a
+            // leaked secret was killed when it was not. An id naming no row is the shape that
+            // matters -- minting into a revoked slot rewrites that row's primary key, so an id from
+            // an earlier `list_credentials` can stop resolving while a caller still holds it, and
+            // reporting success there leaves the live credential authenticating with the audit trail
+            // saying it was revoked. store-mysql and store-memory both fail loud here.
+            return Err(StoreError(format!(
+                "revoke_credential: unknown credential id {id}; nothing was revoked"
+            )));
         }
         let rev = Self::next_revision(&mut tx)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = now_secs();
         // `AND revoked_at IS NULL`: mirrors delete_key's `already_deleted` idempotency (see above) --
         // a repeat revoke_credential call on an already-revoked row must be a true no-op, not bump
         // the global revision / rewrite revoke_reason+updated_at every time it's called. Stated IN
