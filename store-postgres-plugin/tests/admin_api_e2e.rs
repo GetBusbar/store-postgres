@@ -392,10 +392,29 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             401,
             "plugin install without x-admin-token must be rejected with 401, not accepted"
         ),
-        Err(e) => assert!(
-            !e.is_status(),
-            "an unauthenticated install must never be accepted: {e}"
-        ),
+        Err(e) => {
+            // A transport error is only acceptable as "the server closed on us mid-reject". It is
+            // NOT acceptable as "the server was gone", which is what an unqualified `!e.is_status()`
+            // check admits: this call never runs `error_for_status`, so `is_status()` is false for
+            // EVERY error it can produce, including connection-refused because the process had
+            // already died -- a dead server would have read as proof the guard held. Prove the
+            // server is still there and still serving, so the only surviving explanation is a
+            // deliberate reject.
+            assert!(
+                !e.is_status(),
+                "an unauthenticated install must never be accepted: {e}"
+            );
+            let alive = client
+                .get(format!("{admin_base}/plugins?type=store"))
+                .header("x-admin-token", admin_token)
+                .send()
+                .expect("the admin surface must still answer after rejecting the unauthenticated install; a dead server is not evidence that the token guard held");
+            assert_eq!(
+                alive.status().as_u16(),
+                200,
+                "an authenticated read must still succeed after the rejected unauthenticated write"
+            );
+        }
     }
 
     // Confirm the real catalog reports it (not just a 201 with no lasting effect).
@@ -442,10 +461,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "boot #2 (postgres store, the admin-installed plugin)",
     );
 
-    // Poll -- via a RAW independent postgres::Client, never PostgresStore::connect -- for the
-    // `keys` table to appear, exactly like `e2e.rs`'s own boot-time proof: this is the only genuine
-    // confirmation that boot #2 actually dlopened the admin-installed plugin and ran
-    // Store::connect()/migrate() before ever handling a request.
+    // Wait for boot #2 to make progress, and fail fast (with its log) if it exits instead. This is
+    // a PROGRESS WAIT, not the load proof: this test shares the CI database with every other live
+    // test in the workspace, so the `keys` table it polls for is already there and the loop breaks
+    // true on its first iteration regardless of what this child did. The actual proof that boot #2
+    // dlopened the admin-installed plugin and is serving on the Postgres store is the admin-API
+    // mint further down, verified by reading the minted key and credential back over a raw client
+    // -- rows that cannot exist unless this process loaded the plugin and wrote them. (e2e.rs's
+    // file-drop test carries the from-empty version of this check, on its own disposable database.)
     let deadline = Instant::now() + Duration::from_secs(15);
     let booted = loop {
         if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
@@ -473,8 +496,8 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     };
     assert!(
         booted,
-        "boot #2, restarted onto the admin-installed postgres plugin, must create the `keys` \
-         table within 15s -- proof the real dlopen+connect path executed\n\
+        "boot #2, restarted onto the admin-installed postgres plugin, must reach a migrated \
+         `keys` table within 15s\n\
          --- boot #2 output ---\n{}",
         guard2.output()
     );

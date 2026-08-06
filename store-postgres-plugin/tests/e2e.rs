@@ -23,12 +23,15 @@
 //!
 //! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
 //! this part was always sound, only the LOADING mechanism was wrong):
-//!   1. The real boot process is polled, via a RAW independent `postgres::Client` connection (never
-//!      `PostgresStore::connect`, so this check can't accidentally create the schema itself), for
-//!      the `keys` table to appear within a timeout — proof the real dlopen + `Store::connect`/
-//!      migrate path executed during boot, not a proxy for it. If boot never opens the store, or
-//!      exits early, this poll times out / the child-exit check fires, and the test fails.
-//!   2. Only AFTER that proof, a second, independent `PostgresStore::connect` (bypassing the
+//!   1. The boot runs against a DISPOSABLE, freshly created, genuinely empty database, and is polled
+//!      via a RAW independent `postgres::Client` connection (never `PostgresStore::connect`, so this
+//!      check can't create the schema itself) for the `keys` table to appear within a timeout. The
+//!      empty database is what makes this a proof rather than a formality: against the shared test
+//!      database, every live unit test in this workspace has already migrated a `keys` table into
+//!      existence, so the same poll would break true on its first iteration even if `busbar` had
+//!      failed to load the plugin and exited immediately. Then the schema VERSION the boot wrote is
+//!      read back, and the child is confirmed still running rather than having died after migrating.
+//!   2. Only AFTER those proofs, a second, independent `PostgresStore::connect` (bypassing the
 //!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
 //!
 //! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
@@ -108,10 +111,51 @@ fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
-fn cleanup(url: &str, id: &str) {
-    if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
-        let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
-        let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
+/// A suffix unique across concurrently running test binaries against the SAME Postgres instance.
+fn unique_suffix() -> String {
+    format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Rewrite a `postgres://user:pass@host:port/db` URL to name a different database on the same
+/// server, keeping the credentials. The shape is the one this crate's own fixtures and
+/// `dsn_password` already assume.
+fn isolated_db_url(url: &str, db_name: &str) -> String {
+    let rest = url.split("://").nth(1).expect("url must have a scheme");
+    let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
+    let (host_port, _) = host_and_db
+        .split_once('/')
+        .expect("url must have a db path");
+    format!("postgres://{userinfo}@{host_port}/{db_name}")
+}
+
+/// Create a genuinely empty database. The boot proof below rests entirely on this: the shared CI
+/// database already carries a `keys` table by the time this binary runs (every live unit test opens
+/// a `PostgresStore`, and `connect` migrates), so polling it for that table cannot distinguish "this
+/// boot created the schema" from "it was already there" -- the poll would break true on its first
+/// iteration even if `busbar` had failed to load the plugin and exited immediately.
+fn create_fresh_database(url: &str, db_name: &str) -> bool {
+    let Ok(mut maint) = postgres::Client::connect(url, postgres::NoTls) else {
+        return false;
+    };
+    let _ = maint.execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[]);
+    maint
+        .execute(&format!("CREATE DATABASE {db_name}"), &[])
+        .is_ok()
+}
+
+fn drop_database(url: &str, db_name: &str) {
+    if let Ok(mut maint) = postgres::Client::connect(url, postgres::NoTls) {
+        let _ = maint.execute(
+            &format!("DROP DATABASE IF EXISTS {db_name} WITH (FORCE)"),
+            &[],
+        );
     }
 }
 
@@ -156,13 +200,22 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 /// actually be touched — via the documented file-drop mechanism, never a direct `load_store()` call.
 #[test]
 fn load_and_exercise_postgres_plugin_via_file_drop() {
-    let Some(url) = postgres_url() else { return };
+    let Some(admin_url) = postgres_url() else {
+        return;
+    };
     let Some(so_path) = plugin_path() else {
         eprintln!("skip: store-postgres-plugin cdylib not built");
         return;
     };
-    let key_id = "vk_pg_filedrop_e2e";
-    cleanup(&url, key_id);
+
+    // A DISPOSABLE, genuinely empty database, created before the boot and dropped after it. The
+    // schema this test polls for can then only have come from the boot under test.
+    let db = format!("spg_filedrop_{}", unique_suffix());
+    assert!(
+        create_fresh_database(&admin_url, &db),
+        "the file-drop boot proof needs its own empty database; creating {db} failed"
+    );
+    let url = isolated_db_url(&admin_url, &db);
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -259,7 +312,10 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // plugin + config, and poll -- via a RAW independent postgres::Client connection, never
     // PostgresStore::connect, so this check can't accidentally create the schema itself -- for the
     // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
-    // and called Store::connect (which runs migrate()) before ever handling a request.
+    // and called Store::connect (which runs migrate()) before ever handling a request, and it is a
+    // proof only because the database above was created empty for this test alone: against the
+    // shared database every other test in this workspace migrates, `keys` already exists and the
+    // poll would succeed on its first iteration no matter what the child process did.
     let child = Command::new(&busbar_bin)
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
@@ -298,7 +354,29 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
          during boot, not a no-op"
     );
 
-    // Only AFTER that proof: a second, independent PostgresStore::connect (bypassing the
+    // The boot did not just create a table, it landed the CURRENT schema: read the version the
+    // plugin-loaded migrate() wrote, over a raw client. Checked before the direct connect below,
+    // because `PostgresStore::connect` runs migrate() itself and would write this row if the boot
+    // had not.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("raw connect to the fresh database");
+    let version: i64 = raw
+        .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+        .expect("the boot must have created busbar_schema")
+        .get(0);
+    assert!(
+        version > 0,
+        "the plugin-loaded boot must have written a schema version, got {version}"
+    );
+    // And the process is still alive, serving on that store, rather than having created the schema
+    // and died: a crashed child is exactly what the poll above cannot distinguish on its own.
+    assert!(
+        matches!(guard.0.try_wait(), Ok(None)),
+        "the real busbar boot must still be running on the file-dropped postgres store, not have \
+         exited after creating the schema"
+    );
+
+    // Only AFTER those proofs: a second, independent PostgresStore::connect (bypassing the
     // plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema the
     // real boot process just created.
     let _direct = PostgresStore::connect(&url).expect(
@@ -306,9 +384,11 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
          created is usable",
     );
 
-    drop(guard); // explicit: stop the real busbar process before cleanup
+    drop(_direct);
+    drop(raw);
+    drop(guard); // explicit: stop the real busbar process before dropping its database
     let _ = std::fs::remove_dir_all(&work);
-    cleanup(&url, key_id);
+    drop_database(&admin_url, &db);
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
