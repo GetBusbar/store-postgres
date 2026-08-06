@@ -51,13 +51,61 @@ const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
 /// unwinds partway through the test. Same pattern as `e2e.rs`'s own `ChildGuard`.
-struct ChildGuard(Child);
+///
+/// It also owns the path this child's stdout+stderr were redirected to. THAT IS LOAD-BEARING, not
+/// bookkeeping. This test used to spawn busbar with `.stderr(Stdio::null())`, so when a boot failed
+/// the only thing anyone ever saw was
+///
+///     boot #1 exited before its admin listener came up (status: exit status: 1)
+///
+/// -- an exit code and nothing else, with busbar's own diagnosis of WHY thrown away at the point it
+/// was produced. qa-gate run 31059945604 lost this leg to a fail-closed config refusal that busbar
+/// printed in full and this harness deleted; the actual cause had to be recovered from a DIFFERENT
+/// job's logs. A test that can only report "it exited" cannot be debugged from its own output, so
+/// every boot now logs to a file and every failure path prints that file.
+///
+/// A FILE, not `Stdio::piped()`: nothing here reads the pipe while the child runs, so a child that
+/// out-talked the pipe buffer would block forever on write and turn a clean failure into a hang.
+struct ChildGuard(Child, PathBuf);
+
+impl ChildGuard {
+    /// The child's captured output, formatted for a panic message. Never panics itself: this runs
+    /// on the failure path, where a second, unrelated panic would bury the first.
+    fn output(&self) -> String {
+        match std::fs::read_to_string(&self.1) {
+            Ok(s) if s.trim().is_empty() => "  (the child produced no output)".to_string(),
+            Ok(s) => s
+                .lines()
+                .map(|l| format!("  | {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("  (could not read {}: {e})", self.1.display()),
+        }
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Spawn `busbar` with its stdout+stderr captured to `log`, and wrap it in a `ChildGuard` that
+/// knows where to find them. Every boot in this test goes through here, so the capture cannot be
+/// forgotten on a boot added later.
+fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
+    let out = std::fs::File::create(&log)
+        .unwrap_or_else(|e| panic!("create the {what} log at {}: {e}", log.display()));
+    let err = out
+        .try_clone()
+        .unwrap_or_else(|e| panic!("dup the {what} log handle: {e}"));
+    let child = cmd
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn the real busbar for {what}: {e}"));
+    ChildGuard(child, log)
 }
 
 fn postgres_url() -> Option<String> {
@@ -189,12 +237,19 @@ fn wait_for_admin_listener(
             return;
         }
         if let Ok(Some(status)) = guard.0.try_wait() {
-            panic!("{what} exited before its admin listener came up (status: {status})");
+            panic!(
+                "{what} exited before its admin listener came up (status: {status})\n\
+                 --- {what} output ---\n{}",
+                guard.output()
+            );
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what}'s admin listener never came up within 15s"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "{what}'s admin listener never came up within 15s\n\
+                 --- {what} output ---\n{}",
+                guard.output()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -287,17 +342,16 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let config1 = work.join("config1.yaml");
     std::fs::write(&config1, &providers_and_common).unwrap();
 
-    let child1 = Command::new(&busbar_bin)
-        .env("BUSBAR_CONFIG", &config1)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_ADMIN_TOKEN", admin_token)
-        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-        .env("BUSBAR_STATE_FILE", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the real busbar boot (memory store, admin listener up)");
-    let mut guard1 = ChildGuard(child1);
+    let mut guard1 = spawn_busbar(
+        Command::new(&busbar_bin)
+            .env("BUSBAR_CONFIG", &config1)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("BUSBAR_ADMIN_TOKEN", admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            .env("BUSBAR_STATE_FILE", ""),
+        work.join("boot1.log"),
+        "boot #1 (memory store, admin listener up)",
+    );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
 
     // REAL ADMIN-API INSTALL: POST the real cdylib tarball, base64, exactly the wire shape
@@ -381,17 +435,16 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     )
     .unwrap();
 
-    let child2 = Command::new(&busbar_bin)
-        .env("BUSBAR_CONFIG", &config2)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_ADMIN_TOKEN", admin_token)
-        .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-        .env("BUSBAR_STATE_FILE", "")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the real busbar boot (postgres store, the admin-installed plugin)");
-    let mut guard2 = ChildGuard(child2);
+    let mut guard2 = spawn_busbar(
+        Command::new(&busbar_bin)
+            .env("BUSBAR_CONFIG", &config2)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("BUSBAR_ADMIN_TOKEN", admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            .env("BUSBAR_STATE_FILE", ""),
+        work.join("boot2.log"),
+        "boot #2 (postgres store, the admin-installed plugin)",
+    );
 
     // Poll -- via a RAW independent postgres::Client, never PostgresStore::connect -- for the
     // `keys` table to appear, exactly like `e2e.rs`'s own boot-time proof: this is the only genuine
@@ -411,7 +464,11 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             }
         }
         if let Ok(Some(status)) = guard2.0.try_wait() {
-            panic!("boot #2 exited before creating the postgres schema (status: {status})");
+            panic!(
+                "boot #2 exited before creating the postgres schema (status: {status})\n\
+                 --- boot #2 output ---\n{}",
+                guard2.output()
+            );
         }
         if Instant::now() >= deadline {
             break false;
@@ -421,7 +478,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     assert!(
         booted,
         "boot #2, restarted onto the admin-installed postgres plugin, must create the `keys` \
-         table within 15s -- proof the real dlopen+connect path executed"
+         table within 15s -- proof the real dlopen+connect path executed\n\
+         --- boot #2 output ---\n{}",
+        guard2.output()
     );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
 
