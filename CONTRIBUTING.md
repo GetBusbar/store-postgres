@@ -46,12 +46,15 @@ cargo fmt --all -- --check                   # format before committing
 
 ## Architecture
 
-This repo is deliberately a thin adapter (`src/lib.rs`): it turns the engine's
-JSON `open` config into a `PostgresStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the C ABI symbols the loader resolves. All the SQL and schema logic
-lives in the `busbar-store-postgres` library crate this plugin wraps, in the
-`busbarAI` monorepo — most substantive changes belong there, not here.
+This repo is a 2-crate Cargo workspace and brings everything it needs:
+
+- `store-postgres-plugin/` is a thin adapter: it turns the engine's JSON `open`
+  config into a `PostgresStore` and hands the trait object to
+  [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
+  which emits the C ABI symbols the loader resolves.
+- `store-postgres/` is the real library crate: all the SQL, the schema, the
+  migrations and their tests live here, in THIS repository. Most substantive
+  changes belong here, not in the `busbarAI` monorepo.
 
 ## Commit & PR conventions
 

@@ -43,11 +43,15 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
 - **A shared, multi-node governance store.** `store: sqlite` is
   per-node; `store: postgres` puts virtual keys, budgets, and usage
   behind one database so a fleet of busbar nodes agrees on state.
-- It mirrors the SQLite backend's schema and semantics exactly (same
-  tables, same UPSERT shapes, same JSON encoding of `allowed_pools`) so
-  `store: sqlite` and `store: postgres` are drop-in interchangeable —
-  the only differences are the SQL dialect and that Postgres is a
-  shared server.
+- **Drop-in interchangeable with the SQLite backend at the `Store`
+  trait**, which is the boundary busbar actually depends on: the same
+  keys, credentials, tombstone and revision semantics, and the same
+  JSON encoding of `allowed_pools`. The physical tables are NOT
+  identical: Postgres keeps per-model token counters in their own
+  `usage_ledger` table, where SQLite folds them into `usage_windows`
+  with `model` in the primary key. Write reporting queries and ETL
+  against the backend you are actually running, never against the
+  assumption that the two are byte-identical.
 
 ## Known limitations (documented honestly, not papered over)
 
@@ -110,18 +114,31 @@ that migration.
 
 Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
-actually persist." `store-postgres-plugin/tests/e2e.rs` dlopens the
-built cdylib over the real `busbar-plugin-loader` ABI seam (the same
-seam the engine uses for `store: { module: postgres }`), writes a key
-and a usage ledger through it, closes the plugin, and then proves the
-data genuinely landed in Postgres two independent ways: re-opening the
-same cdylib against the same database, and connecting directly with
-the plain `busbar-store-postgres::PostgresStore` — a path that never
-touches the cdylib, the C ABI, or the loader at all.
+actually persist."
 
-Both `store-postgres-plugin/tests/e2e.rs` and `busbar-store-postgres`'s
-own `roundtrip_against_live_postgres` test (`store-postgres/src/tests.rs`,
-same repo now) are gated on the `BUSBAR_TEST_POSTGRES_URL` env var:
+`store-postgres-plugin/tests/e2e.rs` installs the plugin the way an
+operator does: it packs the built cdylib into a real tarball with the
+same tool the release signs, drops it into a real `plugins.dir`, and
+boots a real `busbar` process against `store: { module: postgres }`.
+That boot runs against a disposable, freshly created database, so the
+schema it finds afterwards can only have come from the boot under test.
+Against a shared database the same check would pass whether or not the
+plugin ever loaded.
+
+`store-postgres-plugin/tests/admin_api_e2e.rs` goes one step further:
+it installs the plugin over the real admin API, restarts onto it, mints
+a key with an AWS-shaped credential over that API, and reads both rows
+back with a raw client that never touches the plugin, the C ABI or the
+loader.
+
+`store-postgres/src/tests.rs` holds the store's own coverage against a
+live database: tombstone semantics, slot-safe credential minting,
+revocation, snapshot isolation, and each migration boundary on its own
+throwaway database.
+
+All of them are gated on the `BUSBAR_TEST_POSTGRES_URL` env var, and
+they refuse to skip silently under CI. An unset variable there is a
+hard failure, not a quiet pass:
 
 ```sh
 # Point at any reachable Postgres 16+ database:
