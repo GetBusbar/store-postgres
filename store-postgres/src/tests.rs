@@ -115,7 +115,7 @@ fn connect_store_with_retry(url: &str) -> StoreResult<PostgresStore> {
 
 /// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
 /// reset a row by design), this raw-SQL wipe gives each test a genuinely clean slate for its id, so
-/// re-running the suite (or running it twice, as red-before-green proofs do) never sees stale state
+/// re-running the suite (or running it twice in a row) never sees stale state
 /// from a prior run leaking into the CHECK constraints (e.g. re-minting into a row still marked
 /// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
 fn hard_reset(store: &PostgresStore, id: &str) {
@@ -214,10 +214,9 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 
     store.delete_key(id).unwrap();
 
-    // RED-BEFORE-GREEN evidence lives in the assertions below: this test only passes if delete_key
-    // genuinely tombstones rather than hard-deletes. Confirmed by temporarily reverting delete_key
-    // to `DELETE FROM keys WHERE id=$1` during development: get_key(id) then returned None and this
-    // test failed at the very first assertion, exactly as expected.
+    // The assertions below only pass if delete_key genuinely tombstones rather than hard-deletes:
+    // with delete_key reduced to `DELETE FROM keys WHERE id=$1`, get_key(id) returns None and the
+    // very first assertion fails.
     let after = store.get_key(id).unwrap();
     assert!(
         after.is_some(),
@@ -248,11 +247,10 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 /// that was previously deleted (deleted_at set, enabled=false by delete_key) must produce a fully
 /// LIVE key, not one that is enabled=true while still marked deleted_at.
 ///
-/// RED-BEFORE-GREEN: reverting the ON CONFLICT UPDATE SET clause to omit `deleted_at=NULL` (its
-/// state before this fix) makes this test fail at the `deleted_at` assertion below: `enabled` flips
-/// to `true` as the caller intended, but `deleted_at` is left at whatever the tombstone set it to,
-/// so the row is simultaneously "enabled" and "deleted" -- exactly the corrupt state this test
-/// guards against. Confirmed by temporarily reverting the fix and re-running: this assertion failed.
+/// An ON CONFLICT UPDATE SET clause that omits `deleted_at=NULL` fails at the `deleted_at`
+/// assertion below: `enabled` flips to `true` as the caller intended, but `deleted_at` is left at
+/// whatever the tombstone set it to, so the row is simultaneously "enabled" and "deleted" -- exactly
+/// the corrupt state this test guards against.
 #[test]
 fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
     let Some(url) = live_url() else { return };
@@ -366,11 +364,9 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 /// put_credential_tx must bind CredentialMeta::updated_at to its own column, not silently reuse
 /// created_at's parameter for both.
 ///
-/// RED-BEFORE-GREEN: reverting the fix (VALUES ...,$8,$8,$9,... binding created_at's placeholder
-/// twice, with `updated_at` never bound at all) makes this test fail: the round-tripped
-/// `updated_at` comes back equal to `created_at` (100) instead of the distinct value (200) this
-/// test mints with. Confirmed by temporarily reverting and re-running: assertion failed with
-/// `left: 100, right: 200`.
+/// A `VALUES ...,$8,$8,$9,...` binding -- created_at's placeholder used twice, with `updated_at`
+/// never bound at all -- fails here: the round-tripped `updated_at` comes back equal to `created_at`
+/// (100) instead of the distinct value (200) this test mints with.
 #[test]
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
@@ -450,8 +446,8 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
         .unwrap();
 }
 
-/// HYDRATION-DELTA SOUNDNESS: the exact invariant this session's design work flagged as a real gap
-/// (independently found by the SQLite and MySQL schema design passes). A revision-based delta
+/// HYDRATION-DELTA SOUNDNESS, the same invariant the SQLite and MySQL schemas have to hold. A
+/// revision-based delta
 /// consumer polling list_keys_since/list_credentials_since must be able to observe a delete_key
 /// tombstone AND infer the credential deletion from it, because the credential rows are hard-deleted
 /// and produce no delta of their own.
@@ -574,11 +570,9 @@ fn get_usage_transaction_is_actually_repeatable_read() {
 /// between the two steps on a SEPARATE connection, then asserts REPEATABLE READ's snapshot held: the
 /// second read still sees the pre-interleave state, not the concurrent writer's new model row.
 ///
-/// RED-BEFORE-GREEN: this test is a genuine regression guard rather than a fresh finding (get_usage
-/// already opens REPEATABLE READ via snapshot_consistent_tx) -- confirmed non-vacuous by temporarily
-/// downgrading snapshot_consistent_tx's isolation level to READ COMMITTED and re-running: the
-/// `model_count` assertion below failed (it observed the interleaved writer's new model row), then
-/// passed again after restoring REPEATABLE READ.
+/// Non-vacuous: downgrading `snapshot_consistent_tx`'s isolation level to READ COMMITTED makes the
+/// `model_count` assertion below fail, because the second read then observes the interleaved
+/// writer's new model row.
 #[test]
 fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
     let Some(url) = live_url() else { return };
@@ -719,9 +713,8 @@ fn metering_roundtrip_new_fields() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mutation-testing gap fixes (cargo-mutants round 1 against this file): each test below is named
-// for, and directly targets, one or more MISSED mutants -- confirmed red against the mutant before
-// being folded in green here.
+// Targeted coverage for arithmetic, boundary and guard conditions the broader tests above exercise
+// only incidentally. Each test below pins one specific operator or bound.
 // ---------------------------------------------------------------------------------------------
 
 /// `percent_decode`'s length guard and hi/lo-nibble arithmetic, pinned with cases the existing
@@ -1265,10 +1258,9 @@ fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
 /// unchanged in both cases -- `migrate_locked` unconditionally runs `CREATE TABLE IF NOT EXISTS
 /// busbar_schema` as its very first statement, so by the time the guarded `SELECT` runs, the table
 /// either already exists (guard never fires) or the preceding `CREATE TABLE` itself already
-/// propagated the error several lines earlier (guard never reached). This is a confirmed equivalent
-/// mutant / dead branch given the current code structure, not a test-coverage gap; left unfixed
-/// per policy (no test written to "kill" it, since none can, without changing the source itself --
-/// out of scope for a mutation-testing coverage pass).
+/// propagated the error several lines earlier (guard never reached). The branch is therefore
+/// unreachable given the current code structure rather than merely untested: no test can
+/// distinguish the two behaviours without changing the source.
 #[test]
 fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
     let Some(url) = live_url() else { return };

@@ -74,11 +74,8 @@ fn postgres_url() -> Option<String> {
 /// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
 /// build target of the invocation, e.g. `cargo build --all-targets`) and the raw
 /// `<profile_dir>/deps/<name>` compiler output (refreshed on every build that recompiles the lib,
-/// uplifted or not). A bare `cargo test --release` (what `release-check.sh`'s Phase 2 runs, and what
-/// cargo-mutants runs) does NOT uplift the cdylib to the top-level profile dir, only to
-/// `target/deps` — checking only `profile_dir` silently finds nothing. Same fix already applied to
-/// this crate's sibling `admin_api_e2e.rs` and to auth-oidc-plugin's/webrequest-hook's equivalent
-/// helpers.
+/// uplifted or not). A bare `cargo test --release` does NOT uplift the cdylib to the top-level
+/// profile dir, only to `target/deps`, so checking only `profile_dir` silently finds nothing.
 fn plugin_path() -> Option<PathBuf> {
     let candidate = (|| {
         let exe = std::env::current_exe().ok()?;
