@@ -153,6 +153,19 @@ fn hard_reset(store: &PostgresStore, id: &str) {
     let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
 }
 
+/// Serialises the tests that write to the SHARED `audit_log` table.
+///
+/// `append_audit_never_reports_success_for_a_record_it_did_not_store` arms a STATEMENT-level trigger
+/// on that table, which by construction fires on everyone's inserts. It cannot be narrowed without
+/// making that test vacuous (see its own comment), so instead nothing else writes audit rows while
+/// it is armed. Held only by the handful of tests that touch `audit_log`, so the rest of the suite
+/// stays parallel -- the same shape as store-mysql's `USAGE_WINDOWS_LOCK`.
+static AUDIT_TRIGGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_audit_table() -> std::sync::MutexGuard<'static, ()> {
+    AUDIT_TRIGGER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn sample_key(id: &str) -> VirtualKey {
     VirtualKey {
         id: id.into(),
@@ -1134,6 +1147,7 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
 /// entirely untested -- `append_audit`/`AuditRecord` didn't appear anywhere in this file.
 #[test]
 fn append_audit_is_append_only_and_rejects_a_seq_collision() {
+    let _audit_guard = lock_audit_table();
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     // Derived, not hardcoded: this writes into the SHARED, table-global `audit_log`, and a fixed
@@ -2019,6 +2033,7 @@ mod conformance {
         let Some((store, _ns)) = setup("aud", seq) else {
             return;
         };
+        let _audit_guard = super::lock_audit_table();
         conf::assert_append_audit_duplicate_seq(&store, seq);
     }
 }
@@ -2037,6 +2052,7 @@ mod conformance {
 /// succeed with the record actually present, or fail -- never Ok with nothing stored.
 #[test]
 fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
+    let _audit_guard = lock_audit_table();
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let seq = 920_000_000u64 + (std::process::id() as u64 % 1_000_000);
@@ -2061,20 +2077,25 @@ fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
     store.append_audit(&entry).expect("seed the colliding row");
     let fn_name = format!("busbar_vanish_{}", std::process::id());
     let trg_name = format!("busbar_vanish_trg_{}", std::process::id());
-    // FOR EACH ROW with a WHEN clause pinned to THIS test's seq, not FOR EACH STATEMENT.
+    // FOR EACH STATEMENT, and that is load-bearing rather than incidental.
     //
-    // A statement-level trigger fires on every insert into `audit_log` by anyone. While armed, a
-    // concurrently running sibling test appending its own audit row deleted THIS test's seeded row,
-    // so the forked append below found the seq free, inserted, had its own row deleted by the
-    // trigger, and returned Ok with nothing stored -- the test then failed against a scenario it
-    // never meant to create, 8 runs in 22. Row-level plus `WHEN (NEW.seq = ...)` makes the trigger
-    // inert for every insert except this test's own.
+    // The scenario under test is "the conflicting row vanished underneath the read-back", which is
+    // reached through `INSERT ... ON CONFLICT (seq) DO NOTHING` against an ALREADY-SEEDED seq. That
+    // insert affects ZERO rows, so a row-level trigger never fires at all. A previous attempt here
+    // scoped this to `FOR EACH ROW WHEN (NEW.seq = ...)` to stop it firing on sibling tests' inserts
+    // -- and made the test VACUOUS: the `None` arm was never entered, and reverting the product fix
+    // to the literal silent-loss bug left the suite green.
+    //
+    // The cross-test interference that motivated that change is real (8 failures in 22 runs), but a
+    // statement-level trigger is inherently global, so the isolation has to come from SERIALISING
+    // instead: `AUDIT_TRIGGER_LOCK` above keeps any other audit-writing test out for the window the
+    // trigger is armed.
     client
         .batch_execute(&format!(
             "CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
              BEGIN DELETE FROM audit_log WHERE seq = {seq_lit}; RETURN NULL; END; $$ LANGUAGE plpgsql;
              CREATE TRIGGER {trg_name} AFTER INSERT ON audit_log
-             FOR EACH ROW WHEN (NEW.seq = {seq_lit}) EXECUTE FUNCTION {fn_name}();",
+             FOR EACH STATEMENT EXECUTE FUNCTION {fn_name}();",
             seq_lit = clamp(seq)
         ))
         .unwrap();
