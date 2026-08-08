@@ -39,6 +39,7 @@ jobs:
           if ! out=$(gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "busbar-store-postgres ${GITHUB_REF_NAME}" \
+            --draft \
             --verify-tag --generate-notes 2>&1); then
             if echo "$out" | grep -qi "already exists"; then
               echo "$out"
@@ -188,6 +189,12 @@ jobs:
                  "delete this tag+release, and re-cut." >&2
             exit 1
           fi
+          # Only now, with assets provably attached, does this stop being a draft and become
+          # the release that `releases/latest` resolves to.
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --latest
+          echo "::notice::Published ${GITHUB_REF_NAME} with ${count} asset(s)."
 
   # Instant marketing-site rebuild the moment this plugin ships a real release -- marketing's
   # deploy.yml listens for this exact repository_dispatch event type (plus its own daily-poll
