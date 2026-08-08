@@ -115,8 +115,8 @@ fn connect_store_with_retry(url: &str) -> StoreResult<PostgresStore> {
 
 /// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
 /// reset a row by design), this raw-SQL wipe gives each test a genuinely clean slate for its id, so
-/// re-running the suite (or running it twice, as red-before-green proofs do) never sees stale state
-/// from a prior run leaking into the CHECK constraints (e.g. re-minting into a row still marked
+/// re-running the suite (including running it twice in a row) never sees stale state from a prior
+/// run leaking into the CHECK constraints (e.g. re-minting into a row still marked
 /// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
 fn hard_reset(store: &PostgresStore, id: &str) {
     let mut client = store.lock();
@@ -214,10 +214,9 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 
     store.delete_key(id).unwrap();
 
-    // RED-BEFORE-GREEN evidence lives in the assertions below: this test only passes if delete_key
-    // genuinely tombstones rather than hard-deletes. Confirmed by temporarily reverting delete_key
-    // to `DELETE FROM keys WHERE id=$1` during development: get_key(id) then returned None and this
-    // test failed at the very first assertion, exactly as expected.
+    // The assertions below are non-vacuous: they pass only if delete_key genuinely tombstones
+    // rather than hard-deletes. Were delete_key a plain `DELETE FROM keys WHERE id=$1`, get_key(id)
+    // would return None and the very first assertion below would fail.
     let after = store.get_key(id).unwrap();
     assert!(
         after.is_some(),
@@ -248,11 +247,10 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 /// that was previously deleted (deleted_at set, enabled=false by delete_key) must produce a fully
 /// LIVE key, not one that is enabled=true while still marked deleted_at.
 ///
-/// RED-BEFORE-GREEN: reverting the ON CONFLICT UPDATE SET clause to omit `deleted_at=NULL` (its
-/// state before this fix) makes this test fail at the `deleted_at` assertion below: `enabled` flips
-/// to `true` as the caller intended, but `deleted_at` is left at whatever the tombstone set it to,
-/// so the row is simultaneously "enabled" and "deleted" -- exactly the corrupt state this test
-/// guards against. Confirmed by temporarily reverting the fix and re-running: this assertion failed.
+/// The `deleted_at` assertion below is the load-bearing one: an ON CONFLICT UPDATE SET clause that
+/// omits `deleted_at=NULL` flips `enabled` to `true` as the caller intended but leaves `deleted_at`
+/// at whatever the tombstone set it to, so the row is simultaneously "enabled" and "deleted" --
+/// exactly the corrupt state this test rejects.
 #[test]
 fn put_key_with_credential_on_conflict_clears_a_stale_tombstone() {
     let Some(url) = live_url() else { return };
@@ -366,11 +364,10 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 /// put_credential_tx must bind CredentialMeta::updated_at to its own column, not silently reuse
 /// created_at's parameter for both.
 ///
-/// RED-BEFORE-GREEN: reverting the fix (VALUES ...,$8,$8,$9,... binding created_at's placeholder
-/// twice, with `updated_at` never bound at all) makes this test fail: the round-tripped
-/// `updated_at` comes back equal to `created_at` (100) instead of the distinct value (200) this
-/// test mints with. Confirmed by temporarily reverting and re-running: assertion failed with
-/// `left: 100, right: 200`.
+/// The test is non-vacuous: were the INSERT to bind created_at's placeholder twice
+/// (VALUES ...,$8,$8,$9,...) and never bind `updated_at` at all, the round-tripped `updated_at`
+/// would come back equal to `created_at` (100) instead of the distinct value (200) this test mints
+/// with, and the assertion below would fail with `left: 100, right: 200`.
 #[test]
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
@@ -574,11 +571,10 @@ fn get_usage_transaction_is_actually_repeatable_read() {
 /// between the two steps on a SEPARATE connection, then asserts REPEATABLE READ's snapshot held: the
 /// second read still sees the pre-interleave state, not the concurrent writer's new model row.
 ///
-/// RED-BEFORE-GREEN: this test is a genuine regression guard rather than a fresh finding (get_usage
-/// already opens REPEATABLE READ via snapshot_consistent_tx) -- confirmed non-vacuous by temporarily
-/// downgrading snapshot_consistent_tx's isolation level to READ COMMITTED and re-running: the
-/// `model_count` assertion below failed (it observed the interleaved writer's new model row), then
-/// passed again after restoring REPEATABLE READ.
+/// This is a regression guard on an isolation level get_usage already opens (REPEATABLE READ, via
+/// snapshot_consistent_tx). It is non-vacuous: at READ COMMITTED the `model_count` assertion below
+/// observes the interleaved writer's new model row and fails; only REPEATABLE READ holds the
+/// snapshot across both reads.
 #[test]
 fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
     let Some(url) = live_url() else { return };
@@ -719,9 +715,9 @@ fn metering_roundtrip_new_fields() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mutation-testing gap fixes (cargo-mutants round 1 against this file): each test below is named
-// for, and directly targets, one or more MISSED mutants -- confirmed red against the mutant before
-// being folded in green here.
+// Boundary and arithmetic guards for this file: each test below is named for, and directly
+// targets, one specific predicate or binding whose behaviour was not otherwise pinned. Each fails
+// if that predicate is perturbed in the way its name describes.
 // ---------------------------------------------------------------------------------------------
 
 /// `percent_decode`'s length guard and hi/lo-nibble arithmetic, pinned with cases the existing
@@ -1265,10 +1261,9 @@ fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
 /// unchanged in both cases -- `migrate_locked` unconditionally runs `CREATE TABLE IF NOT EXISTS
 /// busbar_schema` as its very first statement, so by the time the guarded `SELECT` runs, the table
 /// either already exists (guard never fires) or the preceding `CREATE TABLE` itself already
-/// propagated the error several lines earlier (guard never reached). This is a confirmed equivalent
-/// mutant / dead branch given the current code structure, not a test-coverage gap; left unfixed
-/// per policy (no test written to "kill" it, since none can, without changing the source itself --
-/// out of scope for a mutation-testing coverage pass).
+/// propagated the error several lines earlier (guard never reached). Given the current statement
+/// order the guarded branch is therefore unreachable, so no test can drive it without changing the
+/// source itself; the test below pins the reachable half of the behaviour instead.
 #[test]
 fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
     let Some(url) = live_url() else { return };
