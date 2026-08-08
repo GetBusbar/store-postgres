@@ -184,6 +184,44 @@ fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
+/// Every `{ env: NAME }` a config text references, in first-seen order, deduped. Busbar 1.5.3
+/// changed `--validate` to RESOLVE built-in (`env`/`file`) secret references and fail when one
+/// cannot, rather than only checking the reference's shape (a gateway whose credentials are
+/// missing fails every upstream request, and should say so before it boots). A fixture naming a
+/// real-looking var therefore fails `--validate` on THIS MACHINE's environment unless something
+/// sets it first.
+///
+/// Deliberately generic, matching the shape busbarAI core's own `crates/busbar/tests/
+/// docs_examples.rs` and `migration_corpus.rs` use: extracted from the config under test rather
+/// than hardcoded, so a fixture naming a new variable (or a different one) does not rot this
+/// harness.
+fn referenced_env_vars(text: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("env:") {
+        let name: String = text[i + 4..]
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !v.contains(&name) {
+            v.push(name);
+        }
+    }
+    v
+}
+
+/// Set a harmless placeholder for every `{ env: NAME }` `config_text` references, so `--validate`
+/// (which now resolves built-in secrets, see `referenced_env_vars`) has something to resolve.
+/// 64 hex chars: valid for `auth.signing_key`, and harmless as any other secret's value.
+fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
+    for name in referenced_env_vars(config_text) {
+        cmd.env(
+            name,
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        );
+    }
+}
+
 /// The sibling busbarAI checkout's root (same convention this repo already uses for its path deps).
 fn busbarai_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -297,19 +335,16 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
     )
     .unwrap();
-    std::fs::write(
-        &config,
-        format!(
-            "listen: \"127.0.0.1:0\"\n\
-             store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
-             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
-             auth:\n  chain: []\n\
-             providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
-             models:\n  test-model:\n    provider: mock\n",
-            plugins_dir.display()
-        ),
-    )
-    .unwrap();
+    let config_text = format!(
+        "listen: \"127.0.0.1:0\"\n\
+         store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
+         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         auth:\n  chain: []\n\
+         providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+         models:\n  test-model:\n    provider: mock\n",
+        plugins_dir.display()
+    );
+    std::fs::write(&config, &config_text).unwrap();
 
     // `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by
     // design ("no server, no network, no state, no dlopen" -- crates/busbar/src/main.rs's own
@@ -317,12 +352,20 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // file-dropped plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag,
     // below) is the only thing that actually `dlopen`s the plugin and runs
     // `Store::connect`/migration.
-    let out = Command::new(&busbar_bin)
+    //
+    // Busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and fail
+    // when one cannot, instead of only checking the reference's shape -- so `providers.mock.
+    // api_key: { env: MOCK_KEY }` above now needs MOCK_KEY set, or this call fails on THIS
+    // MACHINE's environment rather than on anything about the plugin under test. Extracted
+    // generically (`set_referenced_secret_envs`) rather than hardcoded, so this fixture gaining or
+    // renaming a variable does not rot the harness.
+    let mut validate_cmd = Command::new(&busbar_bin);
+    validate_cmd
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .output()
-        .expect("run busbar --validate");
+        .env("BUSBAR_PROVIDERS", &providers);
+    set_referenced_secret_envs(&mut validate_cmd, &config_text);
+    let out = validate_cmd.output().expect("run busbar --validate");
     assert!(
         out.status.success(),
         "busbar --validate must succeed with the file-dropped postgres plugin: stdout={} stderr={}",
