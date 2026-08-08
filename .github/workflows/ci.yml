@@ -19,7 +19,10 @@ jobs:
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
-      busbar_ref: ${{ github.ref_name }}
+      busbar_ref: ${{ github.base_ref || github.ref_name }}
+      # base_ref FIRST: on a pull_request `github.ref_name` is '<number>/merge', not a branch
+      # name, so this asked busbar for a branch called '5/merge' and the sibling checkout died
+      # with an unreadable git error on EVERY pull request to this repo.
       # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
       # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
       # exercise the monorepo's own copy of the store logic against the sibling busbarAI checkout's
