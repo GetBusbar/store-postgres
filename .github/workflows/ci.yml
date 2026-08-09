@@ -16,7 +16,14 @@ jobs:
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
-      busbar_ref: ${{ github.ref_name }}
+      # Pinned to the core line that carries the durable MCP tool-call log contract, and kept in
+      # step with .busbar-ref DELIBERATELY: CI and release must build against the SAME core, or a
+      # green CI run says nothing about the artifact that actually ships. `dev` does not carry the
+      # contract yet, so building against it would not compile these methods. Move this and
+      # .busbar-ref back to `dev` together, once that line merges.
+      # WAS `${{ github.ref_name }}`, which fed THIS repo's branch name to the core checkout: any
+      # branch whose name was not also a core branch name resolved to something unintended.
+      busbar_ref: feat/1.5.5-mcp-integrated
       # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
       # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
       # exercise the monorepo's own copy of the store logic against the sibling busbarAI checkout's

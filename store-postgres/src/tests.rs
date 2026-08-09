@@ -6,7 +6,9 @@
 //! `postgres:16`.
 
 use super::*;
-use busbar_api::{CredentialMeta, CredentialSecret, ModelTokensDelta, SecretForm, TierTokensDelta};
+use busbar_api::{
+    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TierTokensDelta,
+};
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
 /// `CRED_META_COLUMNS`' own column count, since `str::split` isn't const-evaluable and the constant
@@ -1320,4 +1322,230 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
     ));
     drop(cleanup);
     drop_database(&url, &db);
+}
+
+// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+//
+// The property under test is not "the write returned Ok" — the trait's default `append_mcp_call`
+// returns `Ok(())` and keeps nothing, so a write's return value is worthless as evidence of
+// durability. The only honest way to know a deployment has durable call evidence is to READ IT
+// BACK, and the only honest way to know it survives a deploy is to read it back on a NEW
+// CONNECTION after the writing one is gone.
+
+fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> McpCallRecord {
+    McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// Live Postgres is SHARED across tests, so each test owns its own principal ids and clears them
+/// first — the same isolation-by-unique-id discipline the key tests in this file use.
+fn reset_calls(store: &PostgresStore, principals: &[&str]) {
+    for p in principals {
+        store
+            .lock()
+            .execute("DELETE FROM mcp_calls WHERE principal = $1", &[p])
+            .expect("clear this test's own rows");
+    }
+}
+
+/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
+/// to the server from one holding a HashMap behind the same trait. So this DROPS the store — closing
+/// its connection entirely — then connects a genuinely new one and verifies the per-principal hash
+/// chain still links from the rows the server hands back.
+#[test]
+fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
+    let Some(url) = live_url() else { return };
+    let p = "vk_mcp_restart";
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_calls(&store, &[p]);
+        store
+            .append_mcp_call(&sample_call(p, 1, 2_000_000_100, "", "h1"))
+            .unwrap();
+        store
+            .append_mcp_call(&sample_call(p, 2, 2_000_000_200, "h1", "h2"))
+            .unwrap();
+        store
+            .append_mcp_call(&sample_call(p, 3, 2_000_000_300, "h2", "h3"))
+            .unwrap();
+        drop(store);
+    }
+
+    // A genuinely new connection — nothing carried over in this process.
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let got = reopened.list_mcp_calls(p).unwrap();
+
+    assert_eq!(
+        got.len(),
+        3,
+        "the call log must survive a reconnect; got {} records back, which is the \
+         accept-and-keep-nothing behaviour this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got[0].prev_hash, "",
+        "seq 1 opens the chain with an empty prev_hash"
+    );
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-principal chain must still link after a reconnect: seq {} carries prev_hash \
+             {:?} but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    // The non-indexed payload must round-trip verbatim too.
+    assert_eq!(got[2].tool_digest, "sha256:tool3");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].tool, "srv_read_file");
+    assert_eq!(got[1].pin_generation, 3);
+    reset_calls(&reopened, &[p]);
+}
+
+/// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
+/// seen, so the store must be able to name every principal holding records.
+#[test]
+fn mcp_call_principals_are_enumerable_after_a_reconnect() {
+    let Some(url) = live_url() else { return };
+    let (a, b) = ("vk_mcp_enum_a", "vk_mcp_enum_b");
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_calls(&store, &[a, b]);
+        store
+            .append_mcp_call(&sample_call(a, 1, 2_000_000_100, "", "a1"))
+            .unwrap();
+        store
+            .append_mcp_call(&sample_call(b, 1, 2_000_000_100, "", "b1"))
+            .unwrap();
+        store
+            .append_mcp_call(&sample_call(a, 2, 2_000_000_101, "a1", "a2"))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let principals = reopened.list_mcp_call_principals().unwrap();
+    for want in [a, b] {
+        assert_eq!(
+            principals.iter().filter(|p| p.as_str() == want).count(),
+            1,
+            "{want} must be enumerable after a reconnect, exactly once"
+        );
+    }
+    // The chain scope is the principal: a scoped read returns only its own.
+    assert_eq!(reopened.list_mcp_calls(a).unwrap().len(), 2);
+    assert_eq!(reopened.list_mcp_calls(b).unwrap().len(), 1);
+    assert!(
+        reopened
+            .list_mcp_calls("vk_mcp_nonexistent")
+            .unwrap()
+            .is_empty(),
+        "a principal with no records reads back empty, not an error"
+    );
+    reset_calls(&reopened, &[a, b]);
+}
+
+/// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
+/// not perform is worse than one that reports nothing purged.
+#[test]
+fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let p = "vk_mcp_purge";
+    reset_calls(&store, &[p]);
+    // Retention is GLOBAL by `ts` — it is not scoped to a principal, and cannot be. Against the
+    // SHARED live database that means this test's cutoffs would delete every other test's rows if
+    // the timestamps overlapped, so the suite bands them: this test owns the low band and every
+    // other test sits ABOVE the highest cutoff used here. Caught by exactly that cross-deletion.
+    // A far-future ts keeps this test's rows clear of any other principal's in the shared DB, and
+    // the purge below is scoped by counting only this principal's survivors.
+    store
+        .append_mcp_call(&sample_call(p, 1, 1_000_000_100, "", "h1"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(p, 2, 1_000_000_200, "h1", "h2"))
+        .unwrap();
+    store
+        .append_mcp_call(&sample_call(p, 3, 1_000_000_300, "h2", "h3"))
+        .unwrap();
+
+    let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
+    assert!(
+        purged >= 1,
+        "purge must report the rows it actually removed; got {purged}"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(p)
+            .unwrap()
+            .iter()
+            .map(|r| r.seq)
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+        "rows at or after the cutoff must remain — `before` is strictly less-than, so the row \
+         exactly at the cutoff is kept"
+    );
+    // The count is real: purging past everything clears this principal's remainder.
+    let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
+    assert!(
+        rest >= 2,
+        "the remaining two rows must actually be removed; got {rest}"
+    );
+    assert!(store.list_mcp_calls(p).unwrap().is_empty());
+}
+
+/// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
+/// settles it: BYTE-IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and
+/// is an error. Overwriting would destroy the second case instead of reporting it.
+#[test]
+fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let p = "vk_mcp_replay";
+    reset_calls(&store, &[p]);
+
+    let rec = sample_call(p, 1, 2_000_000_100, "", "h1");
+    store.append_mcp_call(&rec).unwrap();
+    store
+        .append_mcp_call(&rec)
+        .expect("an identical replay is the at-least-once retry and must succeed");
+    assert_eq!(
+        store.list_mcp_calls(p).unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    let forked = sample_call(p, 1, 2_000_000_100, "", "DIFFERENT");
+    let err = store
+        .append_mcp_call(&forked)
+        .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
+    assert!(
+        !format!("{err}").contains("DIFFERENT"),
+        "the error must not echo stored content back"
+    );
+    assert_eq!(
+        store.list_mcp_calls(p).unwrap()[0].hash,
+        "h1",
+        "the refused fork must not have overwritten the record already on record"
+    );
+
+    // A differing non-indexed payload under an identical digest is a fork too, not a silent accept.
+    let mut tampered = sample_call(p, 1, 2_000_000_100, "", "h1");
+    tampered.tool = "srv_other_tool".to_string();
+    store
+        .append_mcp_call(&tampered)
+        .expect_err("a payload that differs under an identical digest is a fork and must error");
+    reset_calls(&store, &[p]);
 }
