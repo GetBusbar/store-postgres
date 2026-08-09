@@ -38,6 +38,8 @@
 //! install work," and converting them to a full process-boot-and-capture-stderr harness for each
 //! error shape is a much larger, lower-value lift than the persistence test's conversion.
 
+mod common;
+
 use busbar_store_postgres::PostgresStore;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -244,7 +246,9 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // file-dropped plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag,
     // below) is the only thing that actually `dlopen`s the plugin and runs
     // `Store::connect`/migration.
-    let out = Command::new(&busbar_bin)
+    let mut validate = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut validate, &[&config, &providers]);
+    let out = validate
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
@@ -262,7 +266,9 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // PostgresStore::connect, so this check can't accidentally create the schema itself -- for the
     // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
     // and called Store::connect (which runs migrate()) before ever handling a request.
-    let child = Command::new(&busbar_bin)
+    let mut boot = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut boot, &[&config, &providers]);
+    let child = boot
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here

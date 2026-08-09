@@ -40,6 +40,8 @@
 //! Together: real admin-API install -> real (admin-API-driven) plugin load -> real admin-API write
 //! -> real, independently-verified Postgres persistence.
 
+mod common;
+
 use base64::Engine as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -286,7 +288,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let config1 = work.join("config1.yaml");
     std::fs::write(&config1, &providers_and_common).unwrap();
 
-    let child1 = Command::new(&busbar_bin)
+    let mut boot1 = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut boot1, &[&config1, &providers]);
+    let child1 = boot1
         .env("BUSBAR_CONFIG", &config1)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
@@ -380,7 +384,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     )
     .unwrap();
 
-    let child2 = Command::new(&busbar_bin)
+    let mut boot2 = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut boot2, &[&config2, &providers]);
+    let child2 = boot2
         .env("BUSBAR_CONFIG", &config2)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
