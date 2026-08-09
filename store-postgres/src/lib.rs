@@ -36,8 +36,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TierTokens, UsageDelta,
-    UsageLedger, VirtualKey,
+    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow, TaskRow,
+    TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
@@ -237,7 +237,18 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// table is new, so `SCHEMA`'s own `CREATE TABLE IF NOT EXISTS` (executed unconditionally on every
 /// migrate) is the entire migration. Nothing is dropped and no existing row is touched, which is why
 /// there is no `version < 7` block to match the `version < 6` one.
-const SCHEMA_VERSION: i64 = 7;
+///
+/// v8: the durable A2A TASK STORE (`tasks`, `task_events`, and the cascade that ties them). Additive
+/// on the same terms as v7 — two new tables, no backfill, nothing dropped, no existing row touched —
+/// so again there is no `version < 8` block.
+const SCHEMA_VERSION: i64 = 8;
+
+/// The task states that are TERMINAL, and therefore the only ones retention may drop. Named as a
+/// closed set rather than derived by negation on purpose: an unrecognised state token — one a newer
+/// engine emits and this build has never heard of — must read as NOT terminal, so a store compiled
+/// before a state existed cannot delete a task it does not understand. The wrong half to guess on is
+/// the deleting half.
+const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
@@ -376,6 +387,96 @@ CREATE TABLE IF NOT EXISTS mcp_calls (
 );
 -- The retention sweep's access path: purge_mcp_calls_before deletes by ts across every principal.
 CREATE INDEX IF NOT EXISTS mcp_calls_ts_idx ON mcp_calls (ts);
+
+-- THE DURABLE A2A TASK STORE. An A2A task spans turns, can sit interrupted waiting on a human, and
+-- can outlive the process that started it, so an in-memory task table loses every in-flight task on
+-- restart -- the difference between a resume that is real and one that is nominal.
+--
+-- SHAPE: every field is a REAL COLUMN, unlike mcp_calls's opaque `body`, and the difference is not
+-- inconsistency. A call record carries open-ended narration that no query ever filters on, so it
+-- pays for a blob and saves the columns. A task row is a small fixed state record where every field
+-- is part of what a resume reads back, `state` and `updated_at` are the retention sweep's own
+-- predicates, and there is no field left over to make opaque. A blob here would buy a deserialise
+-- per read and nothing else.
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id         TEXT PRIMARY KEY,
+    context_id      TEXT NOT NULL,
+    principal       TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    state           TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    artifact_cursor BIGINT NOT NULL,
+    push_callback   TEXT NOT NULL,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+-- The retention sweep's access path (purge_tasks_before filters on state + updated_at), and the
+-- boot rehydrate's (which reads every row and partitions on state).
+CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks (state, updated_at);
+
+-- PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
+-- tasks are concurrent and long-lived: a global chain would serialise every task transition behind
+-- one append and would make one task's provenance unverifiable without possessing every other
+-- tenant's events.
+--
+-- The chain columns -- seq, prev_hash, hash -- are REAL columns for the same reason they are in
+-- mcp_calls: the engine establishes durability by reading the chain back and verifying it, and a
+-- digest reachable only by decoding a blob can be neither constrained nor indexed. This store NEVER
+-- computes or recomputes a digest; it persists what it was handed and returns it verbatim.
+--
+-- Deliberately NO foreign key to `tasks`, even though one would give the cascade for free: a real FK
+-- would also impose an ORDER on the writes -- no event could be appended before its task row existed
+-- -- and the engine is under no such obligation. A `task.submitted` event and the first `put_task`
+-- are two independent write-throughs on the contract, and a store that rejected the pair in the
+-- wrong order would be enforcing an ordering the contract never states. The cascade is a trigger
+-- instead (see tasks_cascade_events below), which gives the retention bound without the ordering.
+CREATE TABLE IF NOT EXISTS task_events (
+    task_id    TEXT NOT NULL,
+    seq        BIGINT NOT NULL,
+    ts         BIGINT NOT NULL,
+    kind       TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    principal  TEXT NOT NULL,
+    agent_id   TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    prev_hash  TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
+
+-- task_events follows its task out of the database, and that cascade is LOAD-BEARING rather than
+-- tidiness: `purge_tasks_before` is the ONLY retention method the contract gives this data, so a
+-- purge that left the events behind would leave `task_events` with no bound anywhere in the trait.
+--
+-- In the database rather than in `purge_tasks_before`'s SQL, so a row removed by any other route --
+-- an operator's psql session, an external retention job -- takes its chain with it too. There is
+-- deliberately no no-update guard to match the one the MCP log would want: the task-event contract
+-- REQUIRES an upsert on (task_id, seq), so forbidding the rewrite would forbid the contract.
+--
+-- FOR EACH ROW, not a statement-level trigger: the retention sweep is off the request path and runs
+-- rarely, and a per-row delete keyed on the primary key is the shape that stays correct if a future
+-- caller ever deletes a single task.
+CREATE OR REPLACE FUNCTION tasks_cascade_events() RETURNS trigger AS $fn$
+BEGIN
+    DELETE FROM task_events WHERE task_id = OLD.task_id;
+    RETURN OLD;
+END;
+$fn$ LANGUAGE plpgsql;
+-- Postgres has no CREATE TRIGGER IF NOT EXISTS, and this whole SCHEMA is re-executed on every
+-- migrate, so the existence check is explicit. DROP-then-CREATE would work too but would take an
+-- ACCESS EXCLUSIVE lock on `tasks` at every single connect, for nothing.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'tasks_cascade_events' AND tgrelid = 'tasks'::regclass
+    ) THEN
+        CREATE TRIGGER tasks_cascade_events AFTER DELETE ON tasks
+            FOR EACH ROW EXECUTE FUNCTION tasks_cascade_events();
+    END IF;
+END
+$do$;
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster). A single mutex-guarded connection —
@@ -1460,6 +1561,129 @@ impl Store for PostgresStore {
         Ok(removed)
     }
 
+    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
+        // Refused rather than clamped, for the reason `append_audit` refuses its own out-of-range
+        // seq/ts: `clamp` pins a `u64` past `i64::MAX` to `i64::MAX`, so the row read back would not
+        // be the row written — and here the value that silently changes is the ARTIFACT CURSOR, i.e.
+        // how much of a stream has been durably relayed. A pinned cursor either replays delivered
+        // artifacts or skips undelivered ones, and does it without an error ever having been
+        // reported.
+        let cursor = as_storable_i64("put_task", "artifact_cursor", task.artifact_cursor)?;
+        let created = as_storable_i64("put_task", "created_at", task.created_at)?;
+        let updated = as_storable_i64("put_task", "updated_at", task.updated_at)?;
+        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
+        // for one task must replace the row, never append a second one for the same id.
+        self.lock()
+            .execute(
+                "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id,
+                                    artifact_cursor, push_callback, created_at, updated_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 ON CONFLICT (task_id) DO UPDATE SET
+                    context_id = EXCLUDED.context_id, principal = EXCLUDED.principal,
+                    direction = EXCLUDED.direction, state = EXCLUDED.state,
+                    agent_id = EXCLUDED.agent_id, artifact_cursor = EXCLUDED.artifact_cursor,
+                    push_callback = EXCLUDED.push_callback, created_at = EXCLUDED.created_at,
+                    updated_at = EXCLUDED.updated_at",
+                &[
+                    &task.task_id,
+                    &task.context_id,
+                    &task.principal,
+                    &task.direction,
+                    &task.state,
+                    &task.agent_id,
+                    &cursor,
+                    &task.push_callback,
+                    &created,
+                    &updated,
+                ],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
+        // No principal filter, deliberately: the contract puts the caller-scoping check engine-side,
+        // because an authorization check living in the backend is one an unauthorized reader
+        // bypasses by configuring a different backend.
+        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE task_id = $1");
+        let row = self.lock().query_opt(&sql, &[&task_id]).store()?;
+        Ok(row.as_ref().map(row_to_task))
+    }
+
+    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
+        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
+        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
+        // store that pre-filtered for any one of those would break the other two.
+        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY task_id");
+        let rows = self.lock().query(&sql, &[]).store()?;
+        Ok(rows.iter().map(row_to_task).collect())
+    }
+
+    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
+        // TERMINAL ONLY, and strictly older than the cutoff. An interrupted task waiting on a human
+        // is exactly the row that legitimately sits still for a long time; compacting it is losing
+        // the work, not reclaiming space. The `= ANY` list is the closed terminal set, so a state
+        // token this build does not recognise is never dropped.
+        //
+        // `execute` returns the rows actually removed, so the count reported is one performed. Each
+        // removed task takes its provenance chain with it via the tasks_cascade_events trigger.
+        let terminal: Vec<String> = TERMINAL_TASK_STATES.iter().map(|s| s.to_string()).collect();
+        let removed = self
+            .lock()
+            .execute(
+                "DELETE FROM tasks WHERE updated_at < $1 AND state = ANY($2)",
+                &[&clamp(before), &terminal],
+            )
+            .store()?;
+        Ok(removed)
+    }
+
+    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
+        let seq = as_storable_i64("append_task_event", "seq", event.seq)?;
+        let ts = as_storable_i64("append_task_event", "ts", event.ts)?;
+        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
+        // `append_mcp_call`'s. That one treats an occupied slot holding a different record as a fork
+        // and refuses it; this one is specified to upsert so the engine's write-through is idempotent
+        // on replay — "rejecting or duplicating a replayed `seq` breaks the chain the engine will
+        // verify on read". Copying the call log's fork check here would be wrong in a way that looks
+        // right, so the difference is stated rather than left to be inferred from the SQL.
+        self.lock()
+            .execute(
+                "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id,
+                                          state, request_id, prev_hash, hash)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                 ON CONFLICT (task_id, seq) DO UPDATE SET
+                    ts = EXCLUDED.ts, kind = EXCLUDED.kind, context_id = EXCLUDED.context_id,
+                    principal = EXCLUDED.principal, agent_id = EXCLUDED.agent_id,
+                    state = EXCLUDED.state, request_id = EXCLUDED.request_id,
+                    prev_hash = EXCLUDED.prev_hash, hash = EXCLUDED.hash",
+                &[
+                    &event.task_id,
+                    &seq,
+                    &ts,
+                    &event.kind,
+                    &event.context_id,
+                    &event.principal,
+                    &event.agent_id,
+                    &event.state,
+                    &event.request_id,
+                    &event.prev_hash,
+                    &event.hash,
+                ],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
+        // Oldest-first by seq — the order the engine's chain verifier reads — and the scope is the
+        // one task, because the chain is per-task.
+        let sql =
+            format!("SELECT {TASK_EVENT_COLUMNS} FROM task_events WHERE task_id = $1 ORDER BY seq");
+        let rows = self.lock().query(&sql, &[&task_id]).store()?;
+        Ok(rows.iter().map(row_to_task_event).collect())
+    }
+
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
@@ -1469,6 +1693,57 @@ impl Store for PostgresStore {
 const AUDIT_COLUMNS: &str = "seq, ts, action, resource, outcome, principal, prev_hash, hash";
 
 const MCP_CALL_COLUMNS: &str = "principal, seq, ts, prev_hash, hash, body";
+
+const TASK_COLUMNS: &str = "task_id, context_id, principal, direction, state, agent_id, \
+                            artifact_cursor, push_callback, created_at, updated_at";
+
+const TASK_EVENT_COLUMNS: &str = "task_id, seq, ts, kind, context_id, principal, agent_id, state, \
+                                  request_id, prev_hash, hash";
+
+/// Reject a `u64` a signed Postgres BIGINT cannot hold, naming the method and the field. `clamp`
+/// would pin it to `i64::MAX` and the read would hand back that instead, so the row read back would
+/// not be the row written — and nothing would ever have reported an error. The same guard
+/// `append_audit` applies inline to its own `seq`/`ts`, factored out here because the task store has
+/// five such fields across two methods.
+fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
+    i64::try_from(v).map_err(|_| {
+        StoreError(format!(
+            "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
+             that would not read back as itself"
+        ))
+    })
+}
+
+fn row_to_task(r: &Row) -> TaskRow {
+    TaskRow {
+        task_id: r.get(0),
+        context_id: r.get(1),
+        principal: r.get(2),
+        direction: r.get(3),
+        state: r.get(4),
+        agent_id: r.get(5),
+        artifact_cursor: read_u64(r.get(6)),
+        push_callback: r.get(7),
+        created_at: read_u64(r.get(8)),
+        updated_at: read_u64(r.get(9)),
+    }
+}
+
+fn row_to_task_event(r: &Row) -> TaskEventRow {
+    TaskEventRow {
+        task_id: r.get(0),
+        seq: read_u64(r.get(1)),
+        ts: read_u64(r.get(2)),
+        kind: r.get(3),
+        context_id: r.get(4),
+        principal: r.get(5),
+        agent_id: r.get(6),
+        state: r.get(7),
+        request_id: r.get(8),
+        prev_hash: r.get(9),
+        hash: r.get(10),
+    }
+}
 
 /// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,
 /// `ts`, `prev_hash` and `hash` are deliberately NOT duplicated here: they are real columns, and a

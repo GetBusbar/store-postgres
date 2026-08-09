@@ -7,7 +7,8 @@
 
 use super::*;
 use busbar_api::{
-    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TierTokensDelta,
+    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TaskEventRow,
+    TaskRow, TierTokensDelta,
 };
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
@@ -2356,4 +2357,494 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         .append_mcp_call(&tampered)
         .expect_err("a payload that differs under an identical digest is a fork and must error");
     reset_calls(&store, &[p]);
+}
+
+// ── THE DURABLE A2A TASK STORE ───────────────────────────────────────────────────────────────
+//
+// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
+// outlive the process that started it. So the property under test is not "put_task returned Ok" —
+// the trait's default `put_task` returns `Ok(())` and keeps nothing, and `get_task` answers `None`
+// for everything, which is a backend that accepts every in-flight task and loses all of them on the
+// next deploy. The only honest proof is to READ THE TASK BACK THROUGH A RESTART, and for a shared
+// server "restart" means dropping the store (closing its connection) and connecting a genuinely NEW
+// one, so the answer can only have come from the server.
+//
+// Every test here runs against its own disposable database (`TempDb`), unlike the MCP call-log tests
+// above, which band their timestamps to share one. That is not a style difference: `purge_tasks_before`
+// is GLOBAL by `updated_at` and cannot be scoped to a task or a principal, so against a shared
+// database a retention test's cutoff deletes every other test's terminal rows. Banding can keep the
+// rows apart, but an isolated database also lets the assertions be EXACT ("the purge removed four
+// rows", "these six survive") rather than the `>=` a shared table forces, and an exact count is
+// precisely what proves a purge performed the number it reported.
+
+fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
+    TaskRow {
+        task_id: task_id.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 7,
+        push_callback: "https://example.test/push".to_string(),
+        created_at: 100,
+        updated_at,
+    }
+}
+
+fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
+    TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        // Saturating: the out-of-range test deliberately passes `u64::MAX` as `seq`, and a helper
+        // that panicked on its own arithmetic would hide the behaviour under test.
+        ts: seq.saturating_add(100),
+        kind: kind.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// THE TEST THAT MATTERS, and it is deliberately not a round-trip through one live handle: a live
+/// handle cannot tell a backend that wrote to the server from one holding a HashMap behind the same
+/// trait, and it cannot tell either of those from the trait's accept-and-keep-nothing defaults if the
+/// defaults are exercised through the very handle that "wrote". So this DROPS the store — closing its
+/// connection entirely — then connects a genuinely NEW one to the same database and reads the task
+/// back off the server. Against the unimplemented state it fails on the very first assertion, with
+/// `get_task` answering `None` for a task that was accepted a moment earlier.
+#[test]
+fn an_in_flight_task_survives_dropping_the_connection_and_reconnecting() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_restart");
+    let iso_url = tmp.url();
+
+    {
+        let store = connect_store_with_retry(&iso_url).expect("connect");
+        store.put_task(&sample_task("t-1", "working", 200)).unwrap();
+        // The write-through on a state transition REPLACES the row rather than appending a second
+        // one — an interrupted task waiting on a human is what a restart has to find.
+        let mut interrupted = sample_task("t-1", "input-required", 300);
+        interrupted.artifact_cursor = 12;
+        store.put_task(&interrupted).unwrap();
+        store
+            .put_task(&sample_task("t-2", "submitted", 210))
+            .unwrap();
+        drop(store);
+    }
+
+    // A genuinely new connection — nothing carried over in this process.
+    let reopened = connect_store_with_retry(&iso_url).expect("reconnect");
+    let got = reopened.get_task("t-1").unwrap().expect(
+        "an in-flight task must survive a restart; got None back on a new connection, which is \
+         the accept-and-keep-nothing default this backend exists to replace",
+    );
+
+    // Every field a resume reads has to come back verbatim — not merely a row with the right id.
+    assert_eq!(got.state, "input-required", "the LAST state must win");
+    assert_eq!(
+        got.artifact_cursor, 12,
+        "the artifact cursor is where a resubscribe resumes; a stale one replays or loses the gap"
+    );
+    assert_eq!(
+        got.context_id, "ctx-t-1",
+        "the resume key is the context id"
+    );
+    assert_eq!(got.principal, "vk_a");
+    assert_eq!(got.direction, "inbound");
+    assert_eq!(got.agent_id, "planner");
+    assert_eq!(got.push_callback, "https://example.test/push");
+    assert_eq!(got.created_at, 100);
+    assert_eq!(got.updated_at, 300);
+
+    // UPSERT, not append: two writes for one task_id leave ONE row.
+    let mut all = reopened.list_tasks().unwrap();
+    all.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    assert_eq!(
+        all.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
+        vec!["t-1", "t-2"],
+        "put_task upserts by task_id; a second write for the same id must replace, never append"
+    );
+
+    assert!(
+        reopened.get_task("t-nonexistent").unwrap().is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+
+    drop(reopened);
+}
+
+/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
+/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
+/// pre-filtered for any one of those would break the other two. Pinned across a reconnect because
+/// the boot rehydrate is precisely the caller that only ever sees the post-restart answer.
+#[test]
+fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_list");
+    let iso_url = tmp.url();
+    {
+        let store = connect_store_with_retry(&iso_url).expect("connect");
+        store
+            .put_task(&sample_task("t-active", "working", 200))
+            .unwrap();
+        store
+            .put_task(&sample_task("t-waiting", "input-required", 201))
+            .unwrap();
+        store
+            .put_task(&sample_task("t-done", "completed", 202))
+            .unwrap();
+        store
+            .put_task(&sample_task("t-failed", "failed", 203))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = connect_store_with_retry(&iso_url).expect("reconnect");
+    let mut ids = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["t-active", "t-done", "t-failed", "t-waiting"],
+        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a restart"
+    );
+    drop(reopened);
+}
+
+/// The per-task provenance chain, read back on a new connection. Per-TASK rather than one global
+/// chain, so the scope of a read is one task and the links have to hold within it.
+#[test]
+fn a_task_event_chain_survives_a_reconnect_and_still_links() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_events");
+    let iso_url = tmp.url();
+    {
+        let store = connect_store_with_retry(&iso_url).expect("connect");
+        store
+            .append_task_event(&sample_event("t-1", 1, "task.submitted", "", "e1"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event("t-1", 2, "task.working", "e1", "e2"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event("t-1", 3, "task.interrupted", "e2", "e3"))
+            .unwrap();
+        // A second task's chain is independent — it must not leak into the first one's read.
+        store
+            .append_task_event(&sample_event("t-2", 1, "task.submitted", "", "f1"))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = connect_store_with_retry(&iso_url).expect("reconnect");
+    let got = reopened.list_task_events("t-1").unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "the provenance chain must survive a reconnect; got {} events back on a new connection, \
+         which is the accept-and-keep-nothing default this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "oldest-first by seq, which is the order the chain verifier reads"
+    );
+    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
+             but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every field round-trips, including the join key that is deliberately NOT chained.
+    assert_eq!(got[2].kind, "task.interrupted");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].context_id, "ctx-t-1");
+    assert_eq!(got[1].principal, "vk_a");
+    assert_eq!(got[1].agent_id, "planner");
+    assert_eq!(got[1].state, "working");
+    assert_eq!(got[1].ts, 102);
+    // The scope of a read is one task.
+    assert_eq!(reopened.list_task_events("t-2").unwrap().len(), 1);
+    assert!(
+        reopened.list_task_events("t-unknown").unwrap().is_empty(),
+        "a task with no events reads back empty, not an error"
+    );
+    drop(reopened);
+}
+
+/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS
+/// from `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a
+/// way that looks right: the contract says a store "must upsert on that pair — the write-through is
+/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
+/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
+/// corrected one.
+#[test]
+fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_replay");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+
+    let e = sample_event("t-1", 1, "task.submitted", "", "e1");
+    store.append_task_event(&e).unwrap();
+    store
+        .append_task_event(&e)
+        .expect("an identical replay must succeed, not be rejected as a fork");
+    assert_eq!(
+        store.list_task_events("t-1").unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    // A rewritten event at the same seq REPLACES, per the contract's "must upsert on that pair".
+    let mut corrected = sample_event("t-1", 1, "task.submitted", "", "e1-corrected");
+    corrected.state = "submitted".to_string();
+    store.append_task_event(&corrected).unwrap();
+    let got = store.list_task_events("t-1").unwrap();
+    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
+    assert_eq!(got[0].hash, "e1-corrected");
+    assert_eq!(got[0].state, "submitted");
+    drop(store);
+}
+
+/// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
+/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
+/// sits still for a long time; compacting it is losing the work, not reclaiming space.
+#[test]
+fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_purge");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+
+    store
+        .put_task(&sample_task("t-old-done", "completed", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-failed", "failed", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-canceled", "canceled", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-rejected", "rejected", 100))
+        .unwrap();
+    // Old, and NOT terminal — never dropped, no matter how old.
+    store
+        .put_task(&sample_task("t-old-waiting", "input-required", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-auth", "auth-required", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-working", "working", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-old-submitted", "submitted", 100))
+        .unwrap();
+    // A state token this build has never heard of — a newer engine's — must read as NOT terminal.
+    // The terminal set is closed and named rather than derived by negation, so the deleting half is
+    // never the half that guesses.
+    store
+        .put_task(&sample_task("t-old-unknown", "some-future-state", 100))
+        .unwrap();
+    // Terminal but at the cutoff exactly, and terminal but newer — both kept.
+    store
+        .put_task(&sample_task("t-at-cutoff", "completed", 200))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-new-done", "completed", 300))
+        .unwrap();
+
+    let purged = store.purge_tasks_before(200).unwrap();
+    assert_eq!(
+        purged, 4,
+        "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
+         actually performed rather than a guess"
+    );
+    let mut left = store
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "t-at-cutoff",
+            "t-new-done",
+            "t-old-auth",
+            "t-old-submitted",
+            "t-old-unknown",
+            "t-old-waiting",
+            "t-old-working",
+        ],
+        "an active, interrupted or unrecognised-state task is never dropped by retention, and \
+         `before` is strictly less-than so a row exactly at the cutoff is kept"
+    );
+    assert_eq!(
+        store.purge_tasks_before(200).unwrap(),
+        0,
+        "re-running the same purge removes nothing"
+    );
+    drop(store);
+}
+
+/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
+/// purging a task left its provenance behind, `task_events` would grow without any bound the
+/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
+/// and drops nothing belonging to any other task.
+#[test]
+fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_cascade");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+
+    store
+        .put_task(&sample_task("t-gone", "completed", 100))
+        .unwrap();
+    store
+        .put_task(&sample_task("t-stays", "working", 100))
+        .unwrap();
+    store
+        .append_task_event(&sample_event("t-gone", 1, "task.submitted", "", "g1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event("t-gone", 2, "task.completed", "g1", "g2"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event("t-stays", 1, "task.submitted", "", "s1"))
+        .unwrap();
+
+    assert_eq!(store.purge_tasks_before(200).unwrap(), 1);
+    assert!(
+        store.list_task_events("t-gone").unwrap().is_empty(),
+        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
+         contract offers no other way to purge them"
+    );
+    assert_eq!(
+        store.list_task_events("t-stays").unwrap().len(),
+        1,
+        "another task's chain must be untouched by that purge"
+    );
+    drop(store);
+}
+
+/// A `seq`/`ts`/`artifact_cursor` past `i64::MAX` cannot be stored faithfully in a signed Postgres
+/// BIGINT — this crate's `clamp` pins it to `i64::MAX`, so the row read back would not be the row
+/// written. Refused outright, exactly as `append_audit` refuses its own out-of-range `seq`/`ts`,
+/// rather than silently mangled: a wrapped ARTIFACT CURSOR either replays delivered artifacts or
+/// skips undelivered ones, and does it without an error ever having been reported.
+#[test]
+fn the_task_store_refuses_values_it_cannot_store_faithfully() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_range");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+
+    let mut t = sample_task("t-1", "working", 200);
+    t.artifact_cursor = u64::MAX;
+    let err = store
+        .put_task(&t)
+        .expect_err("an artifact cursor past i64::MAX must be refused, not clamped");
+    assert!(
+        err.0.contains("storable range"),
+        "the refusal must say why: {}",
+        err.0
+    );
+    assert!(
+        store.get_task("t-1").unwrap().is_none(),
+        "a refused write must leave nothing behind"
+    );
+
+    let mut e = sample_event("t-1", u64::MAX, "task.submitted", "", "e1");
+    assert!(store
+        .append_task_event(&e)
+        .expect_err("a seq past i64::MAX must be refused")
+        .0
+        .contains("storable range"));
+    e.seq = 1;
+    e.ts = u64::MAX;
+    assert!(store
+        .append_task_event(&e)
+        .expect_err("a ts past i64::MAX must be refused")
+        .0
+        .contains("storable range"));
+
+    // The boundary itself is storable and round-trips exactly.
+    t.artifact_cursor = i64::MAX as u64;
+    store.put_task(&t).expect("i64::MAX is in range");
+    assert_eq!(
+        store.get_task("t-1").unwrap().unwrap().artifact_cursor,
+        i64::MAX as u64
+    );
+    drop(store);
+}
+
+/// The v7 -> v8 crossing is additive: a real v7 database gains `tasks` and `task_events` and keeps
+/// every row it already had. Built as a genuine v7 database — the v7 schema, a real row in it, and
+/// `busbar_schema` at 7 — rather than by deleting tables out of a current one, so the migration
+/// under test is the one an existing deployment will actually run.
+#[test]
+fn migrate_v7_to_v8_adds_the_task_store_without_wiping_data() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_task_v7v8");
+    let iso_url = tmp.url();
+
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             INSERT INTO busbar_schema (version) VALUES (7);
+             CREATE TABLE keys (
+                 id              TEXT PRIMARY KEY,
+                 generation_hash TEXT NOT NULL,
+                 name            TEXT NOT NULL,
+                 allowed_pools   TEXT,
+                 enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+                 created_at      BIGINT NOT NULL,
+                 key_group       TEXT,
+                 labels          TEXT NOT NULL DEFAULT '{}',
+                 expires_at      BIGINT,
+                 deleted_at      BIGINT,
+                 revision        BIGINT NOT NULL DEFAULT 0
+             );
+             INSERT INTO keys (id, generation_hash, name, created_at) VALUES ('vk_v7', 'g1', 'n', 0);",
+        )
+        .unwrap();
+    }
+
+    let store =
+        connect_store_with_retry(&iso_url).expect("a v7 database must migrate additively to v8");
+    assert!(
+        store.get_key("vk_v7").unwrap().is_some(),
+        "a real v7 key must survive the v7->v8 crossing"
+    );
+    store
+        .put_task(&sample_task("t-1", "working", 200))
+        .expect("the newly created tasks table must be writable after the migration");
+    store
+        .append_task_event(&sample_event("t-1", 1, "task.submitted", "", "e1"))
+        .expect("the newly created task_events table must be writable after the migration");
+    assert!(store.get_task("t-1").unwrap().is_some());
+    assert_eq!(store.list_task_events("t-1").unwrap().len(), 1);
+
+    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    let version: i64 = check
+        .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(version, SCHEMA_VERSION);
+
+    drop(store);
+    drop(check);
 }
