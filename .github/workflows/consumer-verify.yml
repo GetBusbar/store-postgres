@@ -22,7 +22,7 @@ on:
   release:
     types: [published]
   schedule:
-    - cron: " * * *"
+    - cron: "43 9 * * *"
   workflow_dispatch:
     inputs:
       version:
@@ -47,9 +47,10 @@ jobs:
       plugin_name: busbar-store-postgres-plugin
       plugin_alias: postgres
       plugin_kind: store
-      # This repo publishes a runnable bundle, so the check does not stop at 'the tarball exists':
-      # the image is pulled fresh and the container must BOOT and answer /healthz. That is the
-      # assertion that was missing when the published bundle shipped a config busbar had retired.
-      bundle_image: 43 9
+      # EMPTY, and correct: this repo publishes exactly one kind of artifact, a signed
+      # busbar-store-*.tar.gz per target (see release.yml's `plugin-dist/*.tar.gz` upload) -- no
+      # container bundle anywhere in this repo's workflows. `bundle_image: ""` makes the shared
+      # workflow declare the runnable-bundle boot check NOT-APPLICABLE rather than silently skip it.
+      bundle_image: ""
       bundle_env: ""
     secrets: inherit
