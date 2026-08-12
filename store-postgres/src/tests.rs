@@ -7,7 +7,8 @@
 
 use super::*;
 use busbar_api::{
-    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TierTokensDelta,
+    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TaskEventRow,
+    TaskRow, TierTokensDelta,
 };
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
@@ -2356,4 +2357,535 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         .append_mcp_call(&tampered)
         .expect_err("a payload that differs under an identical digest is a fork and must error");
     reset_calls(&store, &[p]);
+}
+
+// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
+//
+// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
+// outlive the process that started it. So the property under test is never "put_task returned Ok" —
+// the trait's default `put_task` returns `Ok(())` and keeps nothing, `get_task` answers `None` for
+// everything and `list_tasks` answers empty, which is a backend that accepts every in-flight task
+// and loses all of them on restart while reporting success. Every test below therefore DROPS the
+// store (closing its connection entirely) and reads back through a genuinely new one, or asserts a
+// count the defaults could never produce.
+
+/// Timestamps are BANDED, for the same reason the MCP call-log tests band theirs. `purge_tasks_before`
+/// is GLOBAL by `(state, updated_at)` and cannot be scoped to a task or a principal, so against the
+/// SHARED live database a purge test's cutoff would delete every other test's terminal rows if the
+/// timestamps overlapped. Everything below the top of this band belongs to the purge tests; every
+/// other task test writes ABOVE it.
+const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
+const TASK_LIVE_TS: u64 = 2_000_000_000;
+
+/// The two purge tests share the low band and both assert EXACT counts, so they cannot run at the
+/// same time as each other. One lock held by the handful of tests that care keeps the rest of the
+/// suite parallel.
+static TASK_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_task_purge() -> std::sync::MutexGuard<'static, ()> {
+    TASK_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
+    TaskRow {
+        task_id: task_id.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 4,
+        push_callback: "https://caller.example/push".to_string(),
+        created_at: TASK_LIVE_TS,
+        updated_at,
+    }
+}
+
+fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
+    TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        ts: TASK_LIVE_TS + seq,
+        kind: kind.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// The live database is SHARED across tests, so each test owns its own task ids and clears them
+/// first — the same isolation-by-unique-id discipline every other live test in this file uses.
+fn reset_tasks(store: &PostgresStore, task_ids: &[&str]) {
+    for id in task_ids {
+        let mut c = store.lock();
+        c.execute("DELETE FROM task_events WHERE task_id = $1", &[id])
+            .expect("clear this test's own events");
+        c.execute("DELETE FROM tasks WHERE task_id = $1", &[id])
+            .expect("clear this test's own tasks");
+    }
+}
+
+/// Own the whole low band: a previous run's leftovers would otherwise be counted by the exact-count
+/// assertions the purge tests make.
+fn clear_purge_band(store: &PostgresStore) {
+    let mut c = store.lock();
+    c.execute(
+        "DELETE FROM task_events te USING tasks t
+         WHERE te.task_id = t.task_id AND t.updated_at < $1",
+        &[&clamp(TASK_PURGE_BAND_TOP)],
+    )
+    .expect("clear the purge band's events");
+    c.execute(
+        "DELETE FROM tasks WHERE updated_at < $1",
+        &[&clamp(TASK_PURGE_BAND_TOP)],
+    )
+    .expect("clear the purge band");
+}
+
+/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote to
+/// the server from one holding a HashMap behind the same trait — nor from the trait default, which
+/// answers `Ok(())` to the write. So this DROPS the store, closing its connection entirely, then
+/// connects a genuinely new one and reads the task back off the server.
+#[test]
+fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
+    let Some(url) = live_url() else { return };
+    let (t1, t2) = ("t_restart_1", "t_restart_2");
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_tasks(&store, &[t1, t2]);
+        store
+            .put_task(&sample_task(t1, "working", TASK_LIVE_TS + 200))
+            .unwrap();
+        // The state transition the durability actually exists for: a live task becoming an interrupted
+        // one — an interrupted task waiting on a human is what a restart has to find.
+        let mut interrupted = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
+        interrupted.artifact_cursor = 11;
+        store.put_task(&interrupted).unwrap();
+        store
+            .put_task(&sample_task(t2, "submitted", TASK_LIVE_TS + 210))
+            .unwrap();
+        drop(store);
+    }
+
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let got = reopened.get_task(t1).unwrap().expect(
+        "an in-flight task must survive a restart; got None back after reconnecting, which is the \
+         accept-and-keep-nothing shape of the trait default this backend exists to replace",
+    );
+    assert_eq!(
+        got,
+        {
+            let mut expect = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
+            expect.artifact_cursor = 11;
+            expect
+        },
+        "every field must round-trip, and the row read back must be the SECOND write"
+    );
+
+    // UPSERT, not append: two writes for one task_id leave ONE row.
+    let mut ids = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.task_id == t1 || t.task_id == t2)
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![t1, t2],
+        "put_task upserts by task_id; a second write for the same id must replace, never append"
+    );
+    assert!(
+        reopened.get_task("t_nonexistent_task").unwrap().is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+    reset_tasks(&reopened, &[t1, t2]);
+}
+
+/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
+/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
+/// pre-filtered for any one of those would break the other two.
+#[test]
+fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
+    let Some(url) = live_url() else { return };
+    let ids = [
+        "t_list_working",
+        "t_list_interrupted",
+        "t_list_completed",
+        "t_list_failed",
+    ];
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_tasks(&store, &ids);
+        for (id, state) in ids
+            .iter()
+            .zip(["working", "input-required", "completed", "failed"])
+        {
+            store
+                .put_task(&sample_task(id, state, TASK_LIVE_TS + 200))
+                .unwrap();
+        }
+        drop(store);
+    }
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let mut mine = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| ids.contains(&t.task_id.as_str()))
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    mine.sort();
+    let mut expect = ids.to_vec();
+    expect.sort();
+    assert_eq!(
+        mine, expect,
+        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a \
+         reconnect"
+    );
+    reset_tasks(&reopened, &ids);
+}
+
+/// The per-task provenance chain, read back off the server after a reconnect. Per-TASK rather than
+/// one global chain, so the scope of a read is one task and the links have to hold within it.
+///
+/// Note what this test does NOT do: it never calls `put_task`. That is deliberate. A `task.submitted`
+/// event and the first `put_task` are two independent write-throughs and the contract states no
+/// ordering between them, so appending an event for a task with no row yet has to WORK — which is
+/// why `task_events` carries no foreign key to `tasks` (see the schema).
+#[test]
+fn a_task_event_chain_survives_a_reconnect_and_still_links() {
+    let Some(url) = live_url() else { return };
+    let (t1, t2) = ("t_chain_1", "t_chain_2");
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_tasks(&store, &[t1, t2]);
+        store
+            .append_task_event(&sample_event(t1, 1, "task.submitted", "", "e1"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event(t1, 2, "task.working", "e1", "e2"))
+            .unwrap();
+        store
+            .append_task_event(&sample_event(t1, 3, "task.interrupted", "e2", "e3"))
+            .unwrap();
+        // A second task's chain is independent — it must not leak into the first one's read.
+        store
+            .append_task_event(&sample_event(t2, 1, "task.submitted", "", "f1"))
+            .unwrap();
+        drop(store);
+    }
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let got = reopened.list_task_events(t1).unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "the provenance chain must survive a reconnect; got {} event(s) back, which is the \
+         accept-and-keep-nothing default this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "oldest-first by seq, which is the order the chain verifier reads"
+    );
+    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
+             but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every field round-trips, including the join key that is deliberately NOT chained.
+    assert_eq!(got[2].kind, "task.interrupted");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].context_id, format!("ctx-{t1}"));
+    assert_eq!(got[1].principal, "vk_a");
+    assert_eq!(got[1].agent_id, "planner");
+    assert_eq!(got[1].state, "working");
+    assert_eq!(got[1].ts, TASK_LIVE_TS + 2);
+    // The scope of a read is one task.
+    assert_eq!(reopened.list_task_events(t2).unwrap().len(), 1);
+    assert!(
+        reopened
+            .list_task_events("t_unknown_chain")
+            .unwrap()
+            .is_empty(),
+        "a task with no events reads back empty, not an error"
+    );
+    reset_tasks(&reopened, &[t1, t2]);
+}
+
+/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS from
+/// `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a way
+/// that looks right: the contract says a store "must upsert on that pair — the write-through is
+/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
+/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
+/// corrected one.
+#[test]
+fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let t = "t_replay_event";
+    reset_tasks(&store, &[t]);
+
+    let e = sample_event(t, 1, "task.submitted", "", "e1");
+    store.append_task_event(&e).unwrap();
+    store
+        .append_task_event(&e)
+        .expect("an identical replay must succeed, not be rejected as a fork");
+    assert_eq!(
+        store.list_task_events(t).unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    let mut corrected = sample_event(t, 1, "task.submitted", "", "e1-corrected");
+    corrected.state = "submitted".to_string();
+    store.append_task_event(&corrected).unwrap();
+    let got = store.list_task_events(t).unwrap();
+    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
+    assert_eq!(got[0].hash, "e1-corrected");
+    assert_eq!(got[0].state, "submitted");
+    reset_tasks(&store, &[t]);
+}
+
+/// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
+/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
+/// sits still for a long time; compacting it is losing the work, not reclaiming space.
+#[test]
+fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
+    let Some(url) = live_url() else { return };
+    let _guard = lock_task_purge();
+    let store = connect_store_with_retry(&url).expect("connect");
+    clear_purge_band(&store);
+
+    let old = 1_000_000_100;
+    for state in ["completed", "failed", "canceled", "rejected"] {
+        store
+            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .unwrap();
+    }
+    // Old, and NOT terminal — never dropped, no matter how old. `unrecognised-state` stands in for a
+    // token a NEWER engine emits that this build has never heard of: the terminal set is CLOSED, so
+    // an unknown token is kept rather than swept. `Completed` (capital C) is NOT the terminal token
+    // `completed`, and the difference has to survive the SQL — under a non-deterministic
+    // (case-insensitive) database collation `'Completed' = ANY(...)` would be TRUE and the sweep
+    // would drop a state token it never recognised, which is what COLLATE "C" on `tasks.state`
+    // exists to stop.
+    for state in [
+        "input-required",
+        "auth-required",
+        "working",
+        "submitted",
+        "unrecognised-state",
+        "Completed",
+    ] {
+        store
+            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .unwrap();
+    }
+    // Terminal but at the cutoff exactly, and terminal but newer — both kept.
+    store
+        .put_task(&sample_task(
+            "t_purge_at_cutoff",
+            "completed",
+            1_000_000_200,
+        ))
+        .unwrap();
+    store
+        .put_task(&sample_task("t_purge_newer", "completed", 1_000_000_300))
+        .unwrap();
+
+    let purged = store.purge_tasks_before(1_000_000_200).unwrap();
+    assert_eq!(
+        purged, 4,
+        "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
+         actually performed rather than a guess"
+    );
+    let mut left = store
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.updated_at < TASK_PURGE_BAND_TOP)
+        .map(|t| t.task_id)
+        .collect::<Vec<_>>();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "t_purge_at_cutoff",
+            "t_purge_newer",
+            "t_purge_old_Completed",
+            "t_purge_old_auth-required",
+            "t_purge_old_input-required",
+            "t_purge_old_submitted",
+            "t_purge_old_unrecognised-state",
+            "t_purge_old_working",
+        ],
+        "an active or interrupted task is never dropped by retention, an unrecognised state token \
+         is never dropped at all (`Completed` is not `completed`), and `before` is strictly \
+         less-than so a row exactly at the cutoff is kept"
+    );
+    assert_eq!(
+        store.purge_tasks_before(1_000_000_200).unwrap(),
+        0,
+        "re-running the same purge removes nothing"
+    );
+    clear_purge_band(&store);
+}
+
+/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
+/// purging a task left its provenance behind, `task_events` would grow without any bound the
+/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
+/// and drops nothing belonging to any other task.
+#[test]
+fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let Some(url) = live_url() else { return };
+    let _guard = lock_task_purge();
+    let store = connect_store_with_retry(&url).expect("connect");
+    clear_purge_band(&store);
+
+    let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
+    store
+        .put_task(&sample_task(gone, "completed", 1_000_000_100))
+        .unwrap();
+    store
+        .put_task(&sample_task(stays, "working", 1_000_000_100))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(gone, 1, "task.submitted", "", "g1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(gone, 2, "task.completed", "g1", "g2"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(stays, 1, "task.submitted", "", "s1"))
+        .unwrap();
+
+    assert_eq!(
+        store.purge_tasks_before(1_000_000_200).unwrap(),
+        1,
+        "exactly the one terminal task in this band is swept, and the count must be one actually \
+         performed — 0 here is the accept-and-keep-nothing default this backend exists to replace"
+    );
+    assert!(
+        store.list_task_events(gone).unwrap().is_empty(),
+        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
+         contract offers no other way to purge them"
+    );
+    assert_eq!(
+        store.list_task_events(stays).unwrap().len(),
+        1,
+        "another task's chain must be untouched by that purge"
+    );
+    reset_tasks(&store, &[gone, stays]);
+    clear_purge_band(&store);
+}
+
+/// Two task ids differing ONLY IN CASE are two tasks, and the same for two chains. This is the class
+/// of bug store-mysql shipped and then fixed on its audit chain, where a case-insensitive collation
+/// let `vk_alice` read `vk_Alice`'s rows. Here the consequence would be worse in both directions:
+/// the two ids collide on the PRIMARY KEY, so one task silently upserts over the other and one of
+/// them is simply lost. Postgres's default collations are deterministic so this passes without the
+/// explicit `COLLATE "C"` too — the point of pinning it is that this store does not get to choose
+/// the database it is pointed at, and a database created with a non-deterministic ICU collation
+/// would otherwise turn every `=` in this file into a case-insensitive match.
+#[test]
+fn task_ids_differing_only_in_case_are_distinct_tasks() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let (lower, upper) = ("t_case_fold", "T_CASE_FOLD");
+    reset_tasks(&store, &[lower, upper]);
+
+    store
+        .put_task(&sample_task(lower, "working", TASK_LIVE_TS + 400))
+        .unwrap();
+    store
+        .put_task(&sample_task(upper, "completed", TASK_LIVE_TS + 400))
+        .unwrap();
+
+    let a = store
+        .get_task(lower)
+        .unwrap()
+        .expect("the lower-case id must still resolve");
+    let b = store
+        .get_task(upper)
+        .unwrap()
+        .expect("the upper-case id is a DIFFERENT task, not the same row");
+    assert_eq!(a.task_id, lower, "an exact-match lookup must not case-fold");
+    assert_eq!(b.task_id, upper);
+    assert_eq!(
+        a.state, "working",
+        "the second write must not have upserted over the first: they are two tasks"
+    );
+    assert_eq!(b.state, "completed");
+
+    store
+        .append_task_event(&sample_event(lower, 1, "task.submitted", "", "l1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(upper, 1, "task.submitted", "", "u1"))
+        .unwrap();
+    assert_eq!(store.list_task_events(lower).unwrap()[0].hash, "l1");
+    assert_eq!(
+        store.list_task_events(upper).unwrap()[0].hash,
+        "u1",
+        "one task's chain must not answer for another's"
+    );
+    reset_tasks(&store, &[lower, upper]);
+}
+
+/// A `u64` a signed BIGINT cannot hold is REFUSED, not clamped. `clamp` — which every other u64 in
+/// this crate goes through — would pin it to `i64::MAX`, so the row read back would not be the row
+/// written and nothing would ever have reported an error. On this surface the value that silently
+/// changes is the ARTIFACT CURSOR, i.e. how much of a stream has been durably relayed: a mangled
+/// cursor either replays delivered artifacts or skips undelivered ones. Postgres has no unsigned
+/// BIGINT to store the full range in (store-mysql's answer), so refusing is the only honest one.
+#[test]
+fn a_task_field_beyond_the_storable_range_is_refused_rather_than_clamped() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let t = "t_out_of_range";
+    reset_tasks(&store, &[t]);
+
+    let mut task = sample_task(t, "working", TASK_LIVE_TS + 500);
+    task.artifact_cursor = u64::MAX;
+    let err = store
+        .put_task(&task)
+        .expect_err("a cursor above i64::MAX must be refused, never silently clamped");
+    assert!(
+        format!("{err}").contains("artifact_cursor"),
+        "the refusal must name the field that could not be stored; got {err}"
+    );
+    assert!(
+        store.get_task(t).unwrap().is_none(),
+        "a refused write must leave no row behind"
+    );
+
+    let mut event = sample_event(t, 1, "task.submitted", "", "e1");
+    event.seq = u64::MAX;
+    store
+        .append_task_event(&event)
+        .expect_err("a seq above i64::MAX must be refused too");
+    assert!(store.list_task_events(t).unwrap().is_empty());
+
+    // The largest value that DOES fit round-trips exactly, so the guard is a ceiling and not a
+    // blanket refusal of large values.
+    let mut ok = sample_task(t, "working", TASK_LIVE_TS + 500);
+    ok.artifact_cursor = i64::MAX as u64;
+    store.put_task(&ok).unwrap();
+    assert_eq!(
+        store.get_task(t).unwrap().unwrap().artifact_cursor,
+        i64::MAX as u64,
+        "the cursor must not wrap or clamp at the top of the storable range"
+    );
+    reset_tasks(&store, &[t]);
 }

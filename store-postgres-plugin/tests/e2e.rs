@@ -768,3 +768,243 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }
+
+/// THE DURABILITY PROOF FOR THE SIX A2A TASK-STORE METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// The sibling proof above does this for the MCP call log; this one exists because the task methods
+/// are a SEPARATE half of the same defaulted seam and half the fleet used to be missing them.
+/// `busbar_api::Store` defaults `put_task` to `Ok(())`, `get_task` to `Ok(None)` and `list_tasks` to
+/// `Ok(vec![])`: a backend that does not override them ACCEPTS EVERY WRITE AND REPORTS SUCCESS while
+/// keeping nothing. An operator would find "task state survives a restart" false on their own
+/// deployment, which is the worst place to discover it.
+///
+/// The conformance suite cannot see this: it boots the in-process RAM store, where those defaults
+/// ARE the honest answer and nothing looks wrong. The plugin seam is the ONLY path a real Postgres
+/// deployment takes, so it is the only path worth proving on. A unit test against `PostgresStore`
+/// proves the function compiles and works in-process; it does not prove the plugin path reaches it.
+///
+/// So: a REAL `dlopen` of the built cdylib, the real C ABI, the real `DynStore`. Write at arity > 1
+/// (two tasks, one of them UPSERTED a second time, plus two independent provenance chains), DROP the
+/// handle — `busbar_close` runs and the library is unloaded, so nothing this process still holds can
+/// answer the reads — then `dlopen` again and read everything back. A third leg reads the same rows
+/// through the plain `PostgresStore`, never touching the cdylib, so a plugin answering out of its own
+/// in-process cache still fails.
+#[test]
+fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    use busbar_api::{Store, TaskEventRow, TaskRow};
+
+    let path = plugin_path();
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let cfg = cfg(&url);
+
+    // Start from an EMPTY task table. `purge_tasks_before` is GLOBAL and terminal-only, and the
+    // count it returns is asserted exactly below, so a leftover terminal row from an earlier run
+    // would make that assertion meaningless. `purge_tasks_before(MAX)` is the store's own
+    // contract-level wipe of exactly that population, so this needs no raw-SQL knowledge.
+    let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
+    Store::purge_tasks_before(&direct, u64::MAX).expect("wipe terminal tasks before this run");
+
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Per-run ids, so every read below can only be answered by THIS run's writes.
+    let t_live = format!("task_abi_live_{stamp}");
+    let t_done = format!("task_abi_done_{stamp}");
+
+    // A timestamp BAND well above any plausible leftover, so the purge cutoff picked below names
+    // this run's rows and nothing else.
+    const BASE_TS: u64 = 4_000_000_000;
+
+    let task = |id: &str, state: &str, updated_at: u64, cursor: u64| TaskRow {
+        task_id: id.to_string(),
+        context_id: format!("ctx-{id}"),
+        principal: "vk_task_abi".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "agent-7".to_string(),
+        artifact_cursor: cursor,
+        push_callback: "https://callback.example/hook".to_string(),
+        created_at: BASE_TS,
+        updated_at,
+    };
+    let event = |id: &str, seq: u64, kind: &str, prev: &str, hash: &str| TaskEventRow {
+        task_id: id.to_string(),
+        seq,
+        ts: BASE_TS + seq,
+        kind: kind.to_string(),
+        context_id: format!("ctx-{id}"),
+        principal: "vk_task_abi".to_string(),
+        agent_id: "agent-7".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = busbar_plugin_loader::load_store(&path, &cfg)
+            .expect("the postgres plugin must load over the real ABI");
+        store
+            .put_task(&task(&t_live, "working", BASE_TS + 100, 3))
+            .expect("put_task over the ABI");
+        // The SECOND write for the same id: the engine writes through on every state transition, so
+        // this must REPLACE the row, never append a second one. An interrupted task waiting on a
+        // human is exactly what a restart has to find.
+        store
+            .put_task(&task(&t_live, "input-required", BASE_TS + 200, 9))
+            .expect("put_task over the ABI");
+        store
+            .put_task(&task(&t_done, "completed", BASE_TS + 50, 1))
+            .expect("put_task over the ABI");
+        // Two INDEPENDENT chains: per-task provenance that leaked across tasks is a real defect
+        // class, and a single-chain test is blind to it.
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_task_event(&event(&t_live, seq, "task.working", prev, hash))
+                .expect("append_task_event over the ABI");
+        }
+        store
+            .append_task_event(&event(&t_done, 1, "task.completed", "", "d1"))
+            .expect("append_task_event over the ABI");
+        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // connection inside the plugin.
+    let store = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("the postgres plugin must load again over the real ABI");
+
+    let got = store.get_task(&t_live).expect("get_task").expect(
+        "an in-flight task must survive the unload/reload over the plugin ABI; got None back, \
+         which is exactly the accept-and-keep-nothing shape of the trait default an unimplemented \
+         backend (or an unrelayed seam) substitutes",
+    );
+    assert_eq!(
+        got,
+        task(&t_live, "input-required", BASE_TS + 200, 9),
+        "every field must round-trip, and the row read back must be the SECOND write: put_task \
+         upserts by task_id"
+    );
+    assert!(
+        store
+            .get_task(&format!("task_abi_nonexistent_{stamp}"))
+            .expect("get_task on an unknown id is not an error")
+            .is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+
+    let listed = store.list_tasks().expect("list_tasks");
+    let mine = listed
+        .iter()
+        .filter(|t| t.task_id == t_live || t.task_id == t_done)
+        .map(|t| t.task_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mine,
+        vec![t_done.clone(), t_live.clone()],
+        "list_tasks is UNFILTERED — the terminal row is returned too — and the upserted task \
+         appears exactly ONCE; got {} of this run's rows back",
+        mine.len()
+    );
+
+    let events = store.list_task_events(&t_live).expect("list_task_events");
+    assert_eq!(
+        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-task provenance chain must survive the reload, oldest-first by seq; got {} \
+         event(s), the empty shape of the trait default",
+        events.len()
+    );
+    for w in events.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    assert_eq!(events[2].kind, "task.working");
+    assert_eq!(events[2].request_id, "req-3");
+    assert_eq!(
+        store
+            .list_task_events(&t_done)
+            .expect("list_task_events")
+            .len(),
+        1,
+        "one task's chain must not carry another's events"
+    );
+
+    // The task-event contract UPSERTS on (task_id, seq) — the engine's write-through is idempotent
+    // on replay, and rejecting or duplicating a replayed seq breaks the chain it will verify.
+    let mut replayed = event(&t_live, 3, "task.working", "h2", "h3");
+    replayed.state = "input-required".to_string();
+    store
+        .append_task_event(&replayed)
+        .expect("a replayed (task_id, seq) upserts rather than erroring");
+    let events = store.list_task_events(&t_live).expect("list_task_events");
+    assert_eq!(
+        events.len(),
+        3,
+        "a replayed seq must not append a 4th event"
+    );
+    assert_eq!(events[2].state, "input-required");
+
+    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
+    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    assert_eq!(
+        store
+            .purge_tasks_before(BASE_TS + 100)
+            .expect("purge_tasks_before"),
+        1,
+        "only the TERMINAL row older than the cutoff goes; the interrupted task is never swept no \
+         matter how old, because an interrupt waiting on a human is exactly the row that \
+         legitimately sits still"
+    );
+    assert!(
+        store.get_task(&t_done).expect("get_task").is_none(),
+        "the purged task is gone"
+    );
+    assert!(
+        store.get_task(&t_live).expect("get_task").is_some(),
+        "a non-terminal task is never purged"
+    );
+    assert!(
+        store
+            .list_task_events(&t_done)
+            .expect("list_task_events")
+            .is_empty(),
+        "the purge is the ONLY retention method the contract gives task_events, so a swept task's \
+         chain must go with it or it is unbounded forever"
+    );
+    drop(store);
+
+    // LEG 3 — read the surviving row through the plain `PostgresStore`, a code path that never
+    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
+    // in-process state (rather than Postgres) passes both boots and fails here.
+    let direct_task = Store::get_task(&direct, &t_live)
+        .expect("get_task via the direct connection")
+        .expect("the task must be physically present in Postgres, not just cached in-process");
+    assert_eq!(direct_task.artifact_cursor, 9);
+    assert_eq!(direct_task.state, "input-required");
+    assert_eq!(
+        Store::list_task_events(&direct, &t_live)
+            .expect("list_task_events via the direct connection")
+            .len(),
+        3
+    );
+
+    // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
+    Store::put_task(&direct, &task(&t_live, "canceled", BASE_TS + 200, 9))
+        .expect("clean up this run's task");
+    Store::purge_tasks_before(&direct, u64::MAX).expect("clean up this run's rows");
+}
