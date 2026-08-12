@@ -59,10 +59,45 @@ jobs:
       service: postgres
       busbar_ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
 
+  # ── ABI-COMPLETENESS GATE ────────────────────────────────────────────────────────────────────
+  # THE GATE THAT REFUSES A CDYLIB THE PINNED ABI CANNOT CARRY. This runs BEFORE `create-release`,
+  # so a failure here leaves no tag-attached Release, no artifact, no signature and no attestation.
+  #
+  # `gate` above proves this repo's suite passes against the pinned core. It cannot prove the pinned
+  # core's plugin-sdk `dispatch` actually ROUTES the Store methods this repo implements — the suite
+  # exercises the trait in-process, while a shipped plugin is reached over the C ABI. Because
+  # `busbar_api::Store` gives every method a DEFAULT body, an unrouted method does not fail to
+  # compile: it compiles, packs, signs, attests, and then silently takes the default at runtime,
+  # reporting success while dropping the write. busbar 74a1f9fa ("a task written through a plugin
+  # store is no longer discarded") is that bug, already shipped once.
+  #
+  # The check is generic — it derives the method list from this repo's own `impl Store for` block
+  # rather than naming any one feature, so it stays correct as the Store trait grows and cannot go
+  # stale the way a hardcoded pin can. See .github/scripts/verify-abi-completeness.sh.
+  abi-completeness:
+    needs: resolve-busbar-ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout store-postgres
+        uses: actions/checkout@v7
+        with:
+          path: store-postgres
+
+      - name: Checkout busbar at the PINNED .busbar-ref sha (not a branch)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
+          path: busbarAI
+
+      - name: Every Store method implemented here must be routed by the pinned ABI
+        run: bash store-postgres/.github/scripts/verify-abi-completeness.sh store-postgres busbarAI
+        shell: bash
+
   # Create the Release first so the parallel per-target upload jobs have something to attach to
   # (uploading from a matrix without a pre-existing release races -> "release not found").
   create-release:
-    needs: gate
+    needs: [gate, abi-completeness]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
