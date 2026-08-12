@@ -177,6 +177,41 @@ fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
+/// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
+///
+/// busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and exit 1 when
+/// one cannot resolve, rather than only checking the reference's SHAPE. The fixture below names a
+/// real-looking env var (`MOCK_KEY`), so `--validate` failed on any machine that does not happen to
+/// have it set -- which is every CI runner and most dev machines:
+///
+///   [error] providers.mock.api_key: secret env:MOCK_KEY cannot resolve: environment variable
+///   'MOCK_KEY' is unset
+///
+/// Hardcoding `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future
+/// one, names a different variable. Extracting the names generically is the approach the sibling
+/// `GetBusbar/store-sqlite` and `GetBusbar/store-mysql` plugin e2e tests already took for this exact
+/// break (and the core repo's `crates/busbar/tests/docs_examples.rs`), so the harness keeps working
+/// no matter what the fixture references.
+fn referenced_env_vars(text: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for (i, _) in text.match_indices("env:") {
+        let rest = &text[i + 4..];
+        let name: String = rest
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !v.contains(&name) {
+            v.push(name);
+        }
+    }
+    v
+}
+
+/// A placeholder value for a fixture-referenced secret: 64 hex chars, which is valid for
+/// `auth.signing_key` and harmless as any other secret's value.
+const SECRET_PLACEHOLDER: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
 fn cleanup(url: &str, id: &str) {
     if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
         let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
@@ -288,19 +323,16 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
     )
     .unwrap();
-    std::fs::write(
-        &config,
-        format!(
-            "listen: \"127.0.0.1:0\"\n\
-             store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
-             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
-             auth:\n  chain: []\n\
-             providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
-             models:\n  test-model:\n    provider: mock\n",
-            plugins_dir.display()
-        ),
-    )
-    .unwrap();
+    let config_text = format!(
+        "listen: \"127.0.0.1:0\"\n\
+         store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
+         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         auth:\n  chain: []\n\
+         providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+         models:\n  test-model:\n    provider: mock\n",
+        plugins_dir.display()
+    );
+    std::fs::write(&config, &config_text).unwrap();
 
     // `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by
     // design ("no server, no network, no state, no dlopen" -- crates/busbar/src/main.rs's own
@@ -308,12 +340,21 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // file-dropped plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag,
     // below) is the only thing that actually `dlopen`s the plugin and runs
     // `Store::connect`/migration.
-    let out = Command::new(&busbar_bin)
+    //
+    // `--validate` RESOLVES built-in `env:` secret references (busbar 1.5.3), and the real boot
+    // below resolves them too, so BOTH get a placeholder for every one this fixture names -- the
+    // gate then tests the config's SHAPE rather than this machine's environment. See
+    // `referenced_env_vars` for why the names are extracted rather than hardcoded.
+    let fixture_env_vars = referenced_env_vars(&config_text);
+    let mut validate_cmd = Command::new(&busbar_bin);
+    validate_cmd
         .arg("--validate")
         .env("BUSBAR_CONFIG", &config)
-        .env("BUSBAR_PROVIDERS", &providers)
-        .output()
-        .expect("run busbar --validate");
+        .env("BUSBAR_PROVIDERS", &providers);
+    for name in &fixture_env_vars {
+        validate_cmd.env(name, SECRET_PLACEHOLDER);
+    }
+    let out = validate_cmd.output().expect("run busbar --validate");
     assert!(
         out.status.success(),
         "busbar --validate must succeed with the file-dropped postgres plugin: stdout={} stderr={}",
@@ -326,14 +367,17 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // PostgresStore::connect, so this check can't accidentally create the schema itself -- for the
     // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
     // and called Store::connect (which runs migrate()) before ever handling a request.
-    let child = Command::new(&busbar_bin)
+    let mut boot_cmd = Command::new(&busbar_bin);
+    boot_cmd
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn a real busbar boot");
+        .stderr(Stdio::null());
+    for name in &fixture_env_vars {
+        boot_cmd.env(name, SECRET_PLACEHOLDER);
+    }
+    let child = boot_cmd.spawn().expect("spawn a real busbar boot");
     let mut guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -424,4 +468,184 @@ fn refuses_non_plugin() {
         Ok(_) => panic!("a missing library must not load"),
     };
     assert!(err.contains("failed to load plugin"), "got: {err}");
+}
+
+/// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
+/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Postgres. Every existing test
+/// of those four calls `PostgresStore` DIRECTLY, in-process, and NONE of them can see the failure
+/// that actually matters in production, because in production this backend is ONLY ever reached as a
+/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
+/// deployment takes and was, until this test, the one path with zero coverage of these methods.
+///
+/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
+/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
+/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
+/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
+/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
+/// write is the precise shape this test exists to make impossible.
+///
+/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
+/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A restart is what proves durability; a single-row same-session round
+/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
+/// across an unload/reload cannot be faked by either.
+///
+/// A third leg reads the same rows through the plain `PostgresStore`, never touching the cdylib, the
+/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+#[test]
+fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    use busbar_api::{McpCallRecord, Store};
+
+    let path = plugin_path();
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let cfg = cfg(&url);
+
+    // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
+    // GLOBAL, not per-principal, so against a re-used database a leftover chain from an earlier run
+    // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
+    // the store's own contract-level wipe, so this needs no raw-SQL knowledge of the schema. No
+    // other test in this file touches `mcp_calls`.
+    let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+
+    // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
+    // principal's chain leaking into another's is a real defect class and a single-principal test is
+    // blind to it.
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p_main = format!("vk_abi_main_{stamp}");
+    let p_other = format!("vk_abi_other_{stamp}");
+
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts: 2_000 + seq,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = busbar_plugin_loader::load_store(&path, &cfg)
+            .expect("the postgres plugin must load over the real ABI");
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_mcp_call(&call(&p_main, seq, prev, hash))
+                .expect("append_mcp_call over the ABI");
+        }
+        store
+            .append_mcp_call(&call(&p_other, 1, "", "o1"))
+            .expect("append_mcp_call over the ABI");
+        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // connection inside the plugin.
+    let store = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("the postgres plugin must load again over the real ABI");
+
+    let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
+    assert_eq!(
+        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
+         order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
+         default an unrelayed seam substitutes",
+        calls.len()
+    );
+    for w in calls.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every non-indexed field rides the `body` column; a relay that dropped it would still satisfy a
+    // seq-only check.
+    assert_eq!(calls[2].tool_digest, "sha256:tool3");
+    assert_eq!(calls[2].request_id, "req-3");
+    assert_eq!(calls[2].tool, "srv_read_file");
+    assert_eq!(calls[2].outcome, "dispatched");
+    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_other)
+            .expect("list_mcp_calls")
+            .len(),
+        1,
+        "one principal's chain must not carry another's records"
+    );
+
+    let principals = store
+        .list_mcp_call_principals()
+        .expect("list_mcp_call_principals");
+    assert_eq!(
+        principals,
+        vec![p_main.clone(), p_other.clone()],
+        "the boot enumeration must name every principal holding records, exactly once each"
+    );
+
+    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
+    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    assert_eq!(
+        store.purge_mcp_calls_before(2_002).expect("purge"),
+        2,
+        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_main)
+            .expect("list_mcp_calls")
+            .len(),
+        2
+    );
+    assert!(store
+        .list_mcp_calls(&p_other)
+        .expect("list_mcp_calls")
+        .is_empty());
+    assert_eq!(
+        store
+            .list_mcp_call_principals()
+            .expect("list_mcp_call_principals"),
+        vec![p_main.clone()],
+        "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
+         resuming a chain with nothing in it"
+    );
+    drop(store);
+
+    // LEG 3 — read the surviving rows through the plain `PostgresStore`, a code path that never
+    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
+    // in-process state (rather than Postgres) passes both boots and fails here.
+    let direct_calls =
+        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+    assert_eq!(
+        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the records must be physically present in Postgres, not just cached in-process by the plugin"
+    );
+    assert_eq!(direct_calls[1].hash, "h3");
+
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }
