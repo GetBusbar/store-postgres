@@ -187,7 +187,9 @@ fn postgres_url() -> Option<String> {
 /// fail a perfectly current cdylib.
 fn newest_source_mtime() -> std::time::SystemTime {
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -735,10 +737,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
     );
     assert_eq!(
-        store
-            .list_mcp_calls(&p_main)
-            .expect("list_mcp_calls")
-            .len(),
+        store.list_mcp_calls(&p_main).expect("list_mcp_calls").len(),
         2
     );
     assert!(store
