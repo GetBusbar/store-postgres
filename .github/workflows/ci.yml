@@ -19,6 +19,11 @@ jobs:
       plugin_kind: store
       plugin_alias: postgres
       service: postgres
+      # UNPINNED from `feat/1.5.5-mcp-integrated` on merge to dev: that pin existed only because
+      # core `dev` did not yet carry the durable MCP tool-call log contract, and the pin's own note
+      # said to move back to the branch ref once that line merged. Core dev now exports all four
+      # methods (append_mcp_call / list_mcp_calls / list_mcp_call_principals /
+      # purge_mcp_calls_before), so the precondition is met and CI tracks the branch again.
       busbar_ref: ${{ github.base_ref || github.ref_name }}
       # base_ref FIRST: on a pull_request `github.ref_name` is '<number>/merge', not a branch
       # name, so this asked busbar for a branch called '5/merge' and the sibling checkout died

@@ -125,38 +125,106 @@ fn postgres_url() -> Option<String> {
     }
 }
 
-/// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
-/// build target of the invocation, e.g. `cargo build --all-targets`) and the raw
-/// `<profile_dir>/deps/<name>` compiler output (refreshed on every build that recompiles the lib,
-/// uplifted or not). A bare `cargo test --release` does NOT uplift the cdylib to the top-level
-/// profile dir, only to `target/deps`, so checking only `profile_dir` silently finds nothing and
-/// this test's CI hard-panic fires even though the cdylib really was built.
-fn plugin_path() -> Option<PathBuf> {
-    let candidate = (|| {
-        let exe = std::env::current_exe().ok()?;
-        let profile_dir = exe.parent()?.parent()?;
-        let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-        let uplifted = profile_dir.join(&name);
-        let raw = profile_dir.join("deps").join(&name);
-        [uplifted, raw]
-            .into_iter()
-            .filter_map(|p| {
-                std::fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|mtime| (p, mtime))
-            })
-            .max_by_key(|(_, mtime)| *mtime)
-            .map(|(p, _)| p)
-    })();
-    if candidate.is_none() && std::env::var_os("CI").is_some() {
-        panic!(
-            "the store-postgres-plugin cdylib is not built under CI: `cargo test` must build it \
-             (checked both the uplifted target dir and target/deps). Refusing to silently skip the \
-             only over-the-ABI coverage of the durable Postgres store path."
-        );
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
+/// the whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_postgres_plugin.dylib` is by construction up to
+/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
+/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
+/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
+/// build` left there, from any commit — or nothing at all.
+///
+/// Both outcomes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
+///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
+///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
+///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
+///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
+///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
+///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
+///     lookup passed and this one fails.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
+/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
+/// was reading the artifact that edge actually produces.
+///
+/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report of that is a failure, not a silent pass.
+/// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib.
+fn newest_source_mtime() -> std::time::SystemTime {
+    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, newest);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    if m > *newest {
+                        *newest = m;
+                    }
+                }
+            }
+        }
     }
-    candidate
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the plugin crate always sits under the workspace root");
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
+        let src = e.path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut newest);
+        }
+    }
+    newest
+}
+
+fn plugin_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
+    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
+    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
+    let fresh = deps_dir.join(&name);
+    assert!(
+        fresh.exists(),
+        "the store-postgres-plugin cdylib is not at {}, where cargo emits it for the same build that produced \
+         this test binary. Refusing to fall back to target/<profile>/ (an artifact only `cargo \
+         build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed plugin \
+         ABI reads as green.",
+        fresh.display()
+    );
+    // FRESHNESS, ASSERTED — not assumed. Under `cargo test` the artifact above is rebuilt by the
+    // same graph that built this binary (proven: delete it, re-run, cargo re-emits it). But this
+    // test binary can also be executed DIRECTLY out of `deps/`, where nothing rebuilds anything,
+    // and a stale cdylib there produces empty reads — indistinguishable from the unrelayed-ABI
+    // defect. So compare it against the sources and fail with a message that says STALE ARTIFACT,
+    // explicitly NOT a durability verdict.
+    let built = std::fs::metadata(&fresh)
+        .and_then(|m| m.modified())
+        .expect("cdylib mtime");
+    let newest_src = newest_source_mtime();
+    assert!(
+        built >= newest_src,
+        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
+         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
+         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
+         `cargo test`, which rebuilds it) and re-run.",
+        fresh.display(),
+        "busbar-store-postgres-plugin"
+    );
+    fresh
 }
 
 /// The sibling busbarAI checkout's root (same convention `e2e.rs` already uses for its path deps).
@@ -257,10 +325,9 @@ fn wait_for_admin_listener(
 #[test]
 fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let Some(url) = postgres_url() else { return };
-    let Some(so_path) = plugin_path() else {
-        eprintln!("skip: store-postgres-plugin cdylib not built");
-        return;
-    };
+    // `plugin_path()` no longer returns an Option: it panics on a missing-or-stale cdylib rather
+    // than skipping, because a skip here reports green with zero over-the-ABI coverage.
+    let so_path = plugin_path();
     // No pre-test `cleanup` of a hardcoded id: the key this test writes is server-generated, so a
     // fixed id cleans up nothing and only gives a false sense of a clean slate. The real cleanup is
     // of `minted_id`, at the end, once it exists.

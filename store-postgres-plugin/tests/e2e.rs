@@ -147,58 +147,132 @@ fn postgres_url() -> Option<String> {
     }
 }
 
-/// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
-/// build target of the invocation, e.g. `cargo build --all-targets`) and the raw
-/// `<profile_dir>/deps/<name>` compiler output (refreshed on every build that recompiles the lib,
-/// uplifted or not). A bare `cargo test --release` does NOT uplift the cdylib to the top-level
-/// profile dir, only to `target/deps`, so checking only `profile_dir` silently finds nothing.
-fn plugin_path() -> Option<PathBuf> {
-    let candidate = (|| {
-        let exe = std::env::current_exe().ok()?;
-        let profile_dir = exe.parent()?.parent()?;
-        let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-        let uplifted = profile_dir.join(&name);
-        let raw = profile_dir.join("deps").join(&name);
-        [uplifted, raw]
-            .into_iter()
-            .filter_map(|p| {
-                std::fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|mtime| (p, mtime))
-            })
-            .max_by_key(|(_, mtime)| *mtime)
-            .map(|(p, _)| p)
-    })();
-    if candidate.is_none() && std::env::var_os("CI").is_some() {
-        panic!(
-            "the store-postgres-plugin cdylib is not built under CI: `cargo test` must build it \
-             (checked both the uplifted target dir and target/deps). Refusing to silently skip the \
-             only over-the-ABI coverage of the durable Postgres store path."
-        );
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
+/// the whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_postgres_plugin.dylib` is by construction up to
+/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
+/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
+/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
+/// build` left there, from any commit — or nothing at all.
+///
+/// Both outcomes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
+///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
+///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
+///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
+///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
+///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
+///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
+///     lookup passed and this one fails.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
+/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
+/// was reading the artifact that edge actually produces.
+///
+/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report of that is a failure, not a silent pass.
+/// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
+/// one this source tree describes".
+///
+/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
+/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
+/// fail a perfectly current cdylib.
+fn newest_source_mtime() -> std::time::SystemTime {
+    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, newest);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    if m > *newest {
+                        *newest = m;
+                    }
+                }
+            }
+        }
     }
-    candidate
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the plugin crate always sits under the workspace root");
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
+        let src = e.path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut newest);
+        }
+    }
+    newest
+}
+
+fn plugin_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
+    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
+    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
+    let fresh = deps_dir.join(&name);
+    assert!(
+        fresh.exists(),
+        "the store-postgres-plugin cdylib is not at {}, where cargo emits it for the same build that produced \
+         this test binary. Refusing to fall back to target/<profile>/ (an artifact only `cargo \
+         build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed plugin \
+         ABI reads as green.",
+        fresh.display()
+    );
+    // FRESHNESS, ASSERTED — not assumed. Under `cargo test` the artifact above is rebuilt by the
+    // same graph that built this binary (proven: delete it, re-run, cargo re-emits it). But this
+    // test binary can also be executed DIRECTLY out of `deps/`, where nothing rebuilds anything,
+    // and a stale cdylib there produces empty reads — indistinguishable from the unrelayed-ABI
+    // defect. So compare it against the sources and fail with a message that says STALE ARTIFACT,
+    // explicitly NOT a durability verdict.
+    let built = std::fs::metadata(&fresh)
+        .and_then(|m| m.modified())
+        .expect("cdylib mtime");
+    let newest_src = newest_source_mtime();
+    assert!(
+        built >= newest_src,
+        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
+         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
+         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
+         `cargo test`, which rebuilds it) and re-run.",
+        fresh.display(),
+        "busbar-store-postgres-plugin"
+    );
+    fresh
 }
 
 fn cfg(url: &str) -> String {
     serde_json::json!({ "url": url }).to_string()
 }
 
-/// Every `{ env: NAME }` a config text references, in first-seen order, deduped. Busbar 1.5.3
-/// changed `--validate` to RESOLVE built-in (`env`/`file`) secret references and fail when one
-/// cannot, rather than only checking the reference's shape (a gateway whose credentials are
-/// missing fails every upstream request, and should say so before it boots). A fixture naming a
-/// real-looking var therefore fails `--validate` on THIS MACHINE's environment unless something
-/// sets it first.
+/// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
 ///
-/// Deliberately generic, matching the shape busbarAI core's own `crates/busbar/tests/
-/// docs_examples.rs` and `migration_corpus.rs` use: extracted from the config under test rather
-/// than hardcoded, so a fixture naming a new variable (or a different one) does not rot this
-/// harness.
+/// busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and exit 1 when
+/// one cannot resolve, rather than only checking the reference's SHAPE. The fixture below names a
+/// real-looking env var (`MOCK_KEY`), so `--validate` failed on any machine that does not happen to
+/// have it set -- which is every CI runner and most dev machines:
+///
+///   [error] providers.mock.api_key: secret env:MOCK_KEY cannot resolve: environment variable
+///   'MOCK_KEY' is unset
+///
+/// Hardcoding `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future
+/// one, names a different variable. Extracting the names generically is the approach the sibling
+/// `GetBusbar/store-sqlite` and `GetBusbar/store-mysql` plugin e2e tests already took for this exact
+/// break (and the core repo's `crates/busbar/tests/docs_examples.rs`), so the harness keeps working
+/// no matter what the fixture references.
 fn referenced_env_vars(text: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for (i, _) in text.match_indices("env:") {
-        let name: String = text[i + 4..]
+        let rest = &text[i + 4..];
+        let name: String = rest
             .chars()
             .skip_while(|c| c.is_whitespace())
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -266,10 +340,10 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(admin_url) = postgres_url() else {
         return;
     };
-    let Some(so_path) = plugin_path() else {
-        eprintln!("skip: store-postgres-plugin cdylib not built");
-        return;
-    };
+    // `plugin_path()` panics on a missing-or-stale cdylib rather than returning None and skipping:
+    // a skip here reports green with zero over-the-ABI coverage, which is the failure mode the
+    // freshness guard exists to make impossible.
+    let so_path = plugin_path();
 
     // A DISPOSABLE, genuinely empty database. The schema this test polls for can then only have
     // come from the boot under test. The guard drops it on the panic path too, so a red run does
@@ -384,14 +458,17 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     let boot_log = work.join("boot.log");
     let boot_log_out = std::fs::File::create(&boot_log).expect("create the boot log");
     let boot_log_err = boot_log_out.try_clone().expect("dup the boot log handle");
-    let child = Command::new(&busbar_bin)
+    let mut boot_cmd = Command::new(&busbar_bin);
+    boot_cmd
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
         .stdout(Stdio::from(boot_log_out))
-        .stderr(Stdio::from(boot_log_err))
-        .spawn()
-        .expect("spawn a real busbar boot");
+        .stderr(Stdio::from(boot_log_err));
+    // The REAL BOOT resolves `env:` secret references too, not just `--validate`, so it needs the
+    // same placeholders the validate run above got.
+    set_referenced_secret_envs(&mut boot_cmd, &config_text);
+    let child = boot_cmd.spawn().expect("spawn a real busbar boot");
     let mut guard = ChildGuard(child, boot_log);
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -469,10 +546,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 /// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
-    let Some(path) = plugin_path() else {
-        eprintln!("skip: store-postgres-plugin cdylib not built");
-        return;
-    };
+    let path = plugin_path();
 
     let err = busbar_plugin_loader::load_store(&path, "{ not json")
         .err()
@@ -514,4 +588,184 @@ fn refuses_non_plugin() {
         Ok(_) => panic!("a missing library must not load"),
     };
     assert!(err.contains("failed to load plugin"), "got: {err}");
+}
+
+/// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+///
+/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
+/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Postgres. Every existing test
+/// of those four calls `PostgresStore` DIRECTLY, in-process, and NONE of them can see the failure
+/// that actually matters in production, because in production this backend is ONLY ever reached as a
+/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
+/// deployment takes and was, until this test, the one path with zero coverage of these methods.
+///
+/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
+/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
+/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
+/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
+/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
+/// write is the precise shape this test exists to make impossible.
+///
+/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
+/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
+/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
+/// and reads everything back. A restart is what proves durability; a single-row same-session round
+/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
+/// across an unload/reload cannot be faked by either.
+///
+/// A third leg reads the same rows through the plain `PostgresStore`, never touching the cdylib, the
+/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+#[test]
+fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
+    use busbar_api::{McpCallRecord, Store};
+
+    let path = plugin_path();
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let cfg = cfg(&url);
+
+    // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
+    // GLOBAL, not per-principal, so against a re-used database a leftover chain from an earlier run
+    // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
+    // the store's own contract-level wipe, so this needs no raw-SQL knowledge of the schema. No
+    // other test in this file touches `mcp_calls`.
+    let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+
+    // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
+    // principal's chain leaking into another's is a real defect class and a single-principal test is
+    // blind to it.
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let p_main = format!("vk_abi_main_{stamp}");
+    let p_other = format!("vk_abi_other_{stamp}");
+
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
+        principal: principal.to_string(),
+        seq,
+        ts: 2_000 + seq,
+        server: "srv".to_string(),
+        tool: "srv_read_file".to_string(),
+        outcome: "dispatched".to_string(),
+        reason: String::new(),
+        tool_digest: format!("sha256:tool{seq}"),
+        pin_generation: 3,
+        request_id: format!("req-{seq}"),
+        prev_hash: prev.to_string(),
+        hash: hash.to_string(),
+    };
+
+    {
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
+        let store = busbar_plugin_loader::load_store(&path, &cfg)
+            .expect("the postgres plugin must load over the real ABI");
+        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
+            store
+                .append_mcp_call(&call(&p_main, seq, prev, hash))
+                .expect("append_mcp_call over the ABI");
+        }
+        store
+            .append_mcp_call(&call(&p_other, 1, "", "o1"))
+            .expect("append_mcp_call over the ABI");
+        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        drop(store);
+    }
+
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // connection inside the plugin.
+    let store = busbar_plugin_loader::load_store(&path, &cfg)
+        .expect("the postgres plugin must load again over the real ABI");
+
+    let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
+    assert_eq!(
+        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
+         order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
+         default an unrelayed seam substitutes",
+        calls.len()
+    );
+    for w in calls.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
+             persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    // Every non-indexed field rides the `body` column; a relay that dropped it would still satisfy a
+    // seq-only check.
+    assert_eq!(calls[2].tool_digest, "sha256:tool3");
+    assert_eq!(calls[2].request_id, "req-3");
+    assert_eq!(calls[2].tool, "srv_read_file");
+    assert_eq!(calls[2].outcome, "dispatched");
+    assert_eq!(calls[1].pin_generation, 3);
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_other)
+            .expect("list_mcp_calls")
+            .len(),
+        1,
+        "one principal's chain must not carry another's records"
+    );
+
+    let principals = store
+        .list_mcp_call_principals()
+        .expect("list_mcp_call_principals");
+    assert_eq!(
+        principals,
+        vec![p_main.clone(), p_other.clone()],
+        "the boot enumeration must name every principal holding records, exactly once each"
+    );
+
+    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
+    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    assert_eq!(
+        store.purge_mcp_calls_before(2_002).expect("purge"),
+        2,
+        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
+    );
+    assert_eq!(
+        store
+            .list_mcp_calls(&p_main)
+            .expect("list_mcp_calls")
+            .len(),
+        2
+    );
+    assert!(store
+        .list_mcp_calls(&p_other)
+        .expect("list_mcp_calls")
+        .is_empty());
+    assert_eq!(
+        store
+            .list_mcp_call_principals()
+            .expect("list_mcp_call_principals"),
+        vec![p_main.clone()],
+        "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
+         resuming a chain with nothing in it"
+    );
+    drop(store);
+
+    // LEG 3 — read the surviving rows through the plain `PostgresStore`, a code path that never
+    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
+    // in-process state (rather than Postgres) passes both boots and fails here.
+    let direct_calls =
+        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+    assert_eq!(
+        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        vec![2, 3],
+        "the records must be physically present in Postgres, not just cached in-process by the plugin"
+    );
+    assert_eq!(direct_calls[1].hash, "h3");
+
+    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
 }
