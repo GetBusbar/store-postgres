@@ -7,8 +7,8 @@
 
 use super::*;
 use busbar_api::{
-    CredentialMeta, CredentialSecret, McpCallRecord, ModelTokensDelta, SecretForm, TaskEventRow,
-    TaskRow, TierTokensDelta,
+    CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, ModelTokensDelta, SecretForm,
+    TaskEventRow, TaskRow, TierTokensDelta,
 };
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
@@ -2888,4 +2888,345 @@ fn a_task_field_beyond_the_storable_range_is_refused_rather_than_clamped() {
         "the cursor must not wrap or clamp at the top of the storable range"
     );
     reset_tasks(&store, &[t]);
+}
+
+// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
+//
+// Both are security state, and both arrived with the same hole: `busbar_api::Store` defaults
+// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
+// `redeem_ask_state` to `Ok(true)` — "yes, this is the first redemption" — so a backend that
+// implements neither compiles, ships and reports every write successful while discarding it. What
+// that costs is a quarantined upstream that gets the operator's approval back at the next restart,
+// and a single-use human approval that a second node of the fleet redeems again.
+//
+// Every case below reads the state back through a RECONNECTED store, and the ledger cases include a
+// second, genuinely independent connection — which is what a second node of one deployment is.
+
+/// THE LIVE URL, OR A FAILURE. Deliberately NOT `live_url()`, whose `None` arm lets a case return
+/// green having tested nothing: a store method that keeps no ledger and a test that never ran are
+/// the same green, and these two properties are exactly the ones where that costs an operator
+/// something. A test that can skip is a test that will skip on the day it matters.
+fn require_live_url() -> String {
+    std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+        panic!(
+            "BUSBAR_TEST_POSTGRES_URL is unset. These cases are the ONLY coverage of the durable \
+             MCP demotion record and the spent-approval ledger on this backend, and both of them \
+             fail SILENTLY when unimplemented — the trait defaults answer `Ok(())` to a demotion \
+             and `true` to every redemption. Skipping them reports green over a quarantined \
+             upstream that comes back approved and an approval that is redeemable once per node. \
+             Point this at a live Postgres, e.g. \
+             postgres://busbar:busbar@127.0.0.1:5432/busbar_test"
+        )
+    })
+}
+
+/// Per-process namespacing. This suite runs against a SHARED Postgres in CI, so a fixed key would
+/// have two concurrent runs redeeming each other's approvals and reading each other's demotions.
+fn trust_ns(tag: &str) -> String {
+    format!("{}-{}", tag, std::process::id())
+}
+
+const TRUST_NOW: u64 = 2_000_000_000;
+
+fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
+    McpDemotionRow {
+        server: server.to_string(),
+        reason: reason.to_string(),
+        recorded_at,
+    }
+}
+
+/// Drop every row this suite is about to write, so a rerun (or a crashed prior run that left rows
+/// behind) starts where a first run does.
+fn reset_trust_state(store: &PostgresStore, servers: &[&str], nonces: &[&str]) {
+    let mut client = store.lock();
+    for s in servers {
+        let _ = client.execute("DELETE FROM mcp_demotions WHERE server=$1", &[s]);
+    }
+    for n in nonces {
+        let _ = client.execute("DELETE FROM spent_ask_states WHERE nonce=$1", &[n]);
+    }
+}
+
+/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
+/// observation, and a process that has taken no observation has nothing to derive it from — it
+/// serves the upstream against the digest the operator approved. So without this row on the server,
+/// a restart hands a quarantined upstream its approval back.
+#[test]
+fn a_demotion_survives_dropping_the_store_and_reconnecting() {
+    let url = require_live_url();
+    let (a, b, c) = (
+        trust_ns("srv-payments"),
+        trust_ns("srv-search"),
+        trust_ns("srv-mail"),
+    );
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_trust_state(&store, &[&a, &b, &c], &[]);
+        store
+            .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
+            .unwrap();
+        // UPSERT by `server`: a second demotion of one upstream REPLACES the row rather than
+        // standing a rival one beside it, so the boot read cannot hold two answers about one server.
+        store
+            .put_mcp_demotion(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&b, "tool-drift", TRUST_NOW + 20))
+            .unwrap();
+        store
+            .put_mcp_demotion(&demotion(&c, "tool-drift", TRUST_NOW + 30))
+            .unwrap();
+        store
+            .clear_mcp_demotion(&c)
+            .expect("a later observation that agrees with the approval clears the quarantine");
+        store
+            .clear_mcp_demotion(&trust_ns("srv-never-demoted"))
+            .expect("clearing a row that is not there is a no-op, not an error");
+        drop(store);
+    }
+
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    let mut mine = reopened
+        .list_mcp_demotions()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.server == a || r.server == b || r.server == c)
+        .collect::<Vec<_>>();
+    mine.sort_by(|x, y| x.server.cmp(&y.server));
+    let mut expect = vec![
+        demotion(&a, "digest-mismatch", TRUST_NOW + 10),
+        demotion(&b, "tool-drift", TRUST_NOW + 20),
+    ];
+    expect.sort_by(|x, y| x.server.cmp(&y.server));
+    assert_eq!(
+        mine, expect,
+        "the boot read must put every recorded quarantine back in force before the first request is \
+         served — upserted to the LATEST reason, and WITHOUT the one a later agreeing observation \
+         cleared. An empty or stale answer here is the accept-and-keep-nothing trait default, and \
+         it means a restart hands a demoted upstream the operator's approval back"
+    );
+    reset_trust_state(&reopened, &[&a, &b, &c], &[]);
+}
+
+/// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
+/// bytes on its second presentation exactly as on its first; only a record that the first happened
+/// tells them apart. In process memory that record dies with the process while the approval it
+/// records is still openable — so this drops the connection and asks a new one.
+#[test]
+fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
+    let url = require_live_url();
+    let (spent, fresh) = (trust_ns("nonce-restart"), trust_ns("nonce-restart-other"));
+    {
+        let store = connect_store_with_retry(&url).expect("connect");
+        reset_trust_state(&store, &[], &[&spent, &fresh]);
+        assert!(
+            store
+                .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
+                .unwrap(),
+            "the FIRST redemption must be answered `true`, or nothing below is about single use"
+        );
+        drop(store);
+    }
+
+    let reopened = connect_store_with_retry(&url).expect("reconnect");
+    assert!(
+        !reopened
+            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .unwrap(),
+        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
+         is the point of it — so the only thing that changed is that the process which recorded the \
+         redemption is gone. On a tool an operator gated because it moves money, that second \
+         redemption is the whole defect the gate exists to stop"
+    );
+    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
+    // above and would have deleted the feature.
+    assert!(
+        reopened
+            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .unwrap(),
+        "a different approval is not the one that was spent; refusing it would make the ledger a \
+         blanket refusal of every confirmation after the first"
+    );
+    reset_trust_state(&reopened, &[], &[&spent, &fresh]);
+}
+
+/// TWO CONNECTIONS ARE TWO NODES OF A FLEET, and this is the arrangement the durable ledger exists
+/// for. They share the deployment's signing key, so they share the SEAL — every check but this one
+/// passes on both — and the second redemption needs no timing skill at all: it is an ordinary
+/// sequential request that a load balancer sends somewhere else.
+#[test]
+fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
+    let url = require_live_url();
+    let nonce = trust_ns("nonce-fleet");
+    let node_a = connect_store_with_retry(&url).expect("node A connects");
+    let node_b = connect_store_with_retry(&url).expect("node B connects");
+    reset_trust_state(&node_a, &[], &[&nonce]);
+
+    assert!(node_a
+        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        !node_b
+            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "a second node of the same deployment redeemed an approval the first already spent, which \
+         is one operator confirmation executing once per node"
+    );
+    reset_trust_state(&node_a, &[], &[&nonce]);
+}
+
+/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS — not
+/// eight threads sharing one — race on one approval through a barrier, which is the arrangement a
+/// read-then-write implementation answers "first" to eight times. Exactly one may win.
+#[test]
+fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
+    let url = require_live_url();
+    let nonce = trust_ns("nonce-race");
+    let cleanup = connect_store_with_retry(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+    drop(cleanup);
+
+    let n = 8usize;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let winners: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let url = url.clone();
+                let nonce = nonce.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let node = connect_store_with_retry(&url).expect("a racing node connects");
+                    barrier.wait();
+                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+                        .expect("redeem_ask_state") as usize
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    assert_eq!(
+        winners, 1,
+        "exactly one redemption of one approval may be the first; {winners} nodes were each told \
+         they were, which is a test-and-set that is really a read followed by a write"
+    );
+    let cleanup = connect_store_with_retry(&url).expect("connect");
+    reset_trust_state(&cleanup, &[], &[&nonce]);
+}
+
+/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW. `now` is handed to every redemption so the
+/// backend can drop what has lapsed in the same call — an entry recording an approval that can no
+/// longer be opened protects nothing, and a table that only grows is its own outage.
+#[test]
+fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
+    let url = require_live_url();
+    let (short, long, other) = (
+        trust_ns("nonce-short"),
+        trust_ns("nonce-long"),
+        trust_ns("nonce-sweeper"),
+    );
+    let store = connect_store_with_retry(&url).expect("connect");
+    reset_trust_state(&store, &[], &[&short, &long, &other]);
+
+    assert!(store
+        .redeem_ask_state(&short, TRUST_NOW + 10, TRUST_NOW)
+        .unwrap());
+    assert!(store
+        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
+        .unwrap());
+
+    // A redemption past the first entry's expiry: the sweep rides along with it.
+    let later = TRUST_NOW + 11;
+    assert!(store.redeem_ask_state(&other, later + 900, later).unwrap());
+
+    let still_there = |nonce: &str| -> bool {
+        store
+            .lock()
+            .query_one(
+                "SELECT COUNT(*) FROM spent_ask_states WHERE nonce=$1",
+                &[&nonce],
+            )
+            .map(|r| r.get::<_, i64>(0) > 0)
+            .expect("count the ledger row")
+    };
+    assert!(
+        !still_there(&short),
+        "the entry whose approval can no longer be opened must be evicted by the sweep the \
+         redemption carries; a ledger that only grows is its own outage"
+    );
+    assert!(
+        still_there(&long),
+        "an approval still inside its window must NOT be swept — evicting it early is exactly the \
+         double redemption this ledger exists to refuse"
+    );
+    reset_trust_state(&store, &[], &[&short, &long, &other]);
+}
+
+/// REFUSED RATHER THAN CLAMPED, and here the reason is sharper than it is for a task cursor. The
+/// crate-wide `clamp` pins a `u64` above `i64::MAX` to `i64::MAX`; a `now` clamped that way sweeps
+/// the ENTIRE ledger and then reports the insert as a first redemption, i.e. an out-of-range
+/// argument would silently reopen every spent approval in the deployment. The engine's call site
+/// turns a store error into a REFUSED redemption, so an error is the direction to fail in.
+#[test]
+fn the_ledger_refuses_values_it_cannot_store_faithfully() {
+    let url = require_live_url();
+    let nonce = trust_ns("nonce-range");
+    let store = connect_store_with_retry(&url).expect("connect");
+    reset_trust_state(&store, &[&trust_ns("srv-range")], &[&nonce]);
+
+    store
+        .redeem_ask_state(&nonce, u64::MAX, TRUST_NOW)
+        .expect_err("an unstorable expires_at must be an error, never a silent first redemption");
+    store
+        .redeem_ask_state(&nonce, TRUST_NOW + 900, u64::MAX)
+        .expect_err(
+        "an unstorable now must be an error: clamped to i64::MAX it would evict the entire ledger \
+         and then report every replay as a first redemption",
+    );
+    store
+        .put_mcp_demotion(&demotion(&trust_ns("srv-range"), "tool-drift", u64::MAX))
+        .expect_err("an unstorable recorded_at must be an error rather than a mangled row");
+
+    // The top of the storable range still stores, so the guard is a ceiling and not a blanket
+    // refusal of large values.
+    assert!(store
+        .redeem_ask_state(&nonce, i64::MAX as u64, TRUST_NOW)
+        .unwrap());
+    reset_trust_state(&store, &[&trust_ns("srv-range")], &[&nonce]);
+}
+
+/// THE NEW TABLES CARRY AN EXPLICIT COLLATION, and it is not decoration. This store does not get to
+/// choose the database it is pointed at, and a database created with a NON-DETERMINISTIC ICU
+/// collation makes `=` case- and accent-insensitive. On these two tables that is a security defect
+/// rather than a curiosity: two upstream ids differing only in case would COLLIDE on the demotion
+/// primary key (one quarantine silently overwriting another's), and — far worse — a nonce differing
+/// only in case from a spent one would collide too, so `redeem_ask_state` would refuse a DIFFERENT,
+/// legitimately fresh approval, while an attacker's near-miss variants map onto one row. `COLLATE
+/// "C"` states byte-exactness rather than inheriting it. Asserted from the catalogue, so the DDL
+/// cannot quietly lose it.
+#[test]
+fn the_trust_state_key_columns_pin_a_byte_exact_collation() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    for (table, column) in [("mcp_demotions", "server"), ("spent_ask_states", "nonce")] {
+        let collation: Option<String> = store
+            .lock()
+            .query_one(
+                "SELECT c.collname FROM pg_attribute a
+                   JOIN pg_class t ON t.oid = a.attrelid
+                   LEFT JOIN pg_collation c ON c.oid = a.attcollation
+                  WHERE t.relname = $1 AND a.attname = $2 AND a.attnum > 0",
+                &[&table, &column],
+            )
+            .map(|r| r.get(0))
+            .unwrap_or_else(|e| panic!("{table}.{column} must exist in the catalogue: {e}"));
+        assert_eq!(
+            collation.as_deref(),
+            Some("C"),
+            "{table}.{column} must pin COLLATE \"C\". Inheriting the database's collation means a \
+             non-deterministic ICU database decides whether two distinct keys are the same key, and \
+             on a ledger whose whole job is telling one nonce from another that is the defect"
+        );
+    }
 }

@@ -35,9 +35,9 @@
 //!   added later without another schema bump.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow, TaskRow,
-    TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
+    MeteringRow, ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow,
+    TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
@@ -242,7 +242,13 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// — two new tables and one new index, all reached by `SCHEMA`'s unconditional
 /// `CREATE TABLE IF NOT EXISTS`, nothing dropped and no existing row touched — so there is no
 /// `version < 8` block either.
-const SCHEMA_VERSION: i64 = 8;
+///
+/// v9: the durable TRUST STATE (`mcp_demotions`, `spent_ask_states`) — the recorded quarantine of an
+/// upstream that drifted from what the operator approved, and the ledger that makes a single-use
+/// human approval single-use across a restart and across a fleet. ADDITIVE on exactly the same terms
+/// as v7 and v8 — two new tables reached by `SCHEMA`'s unconditional `CREATE TABLE IF NOT EXISTS`,
+/// nothing dropped, no existing row touched — so there is no `version < 9` block either.
+const SCHEMA_VERSION: i64 = 9;
 
 /// The task states that are TERMINAL, and therefore the only ones `purge_tasks_before` may drop.
 /// A CLOSED set, deliberately: a task state token minted by a NEWER engine than this build is one
@@ -461,6 +467,54 @@ CREATE TABLE IF NOT EXISTS task_events (
     prev_hash  TEXT NOT NULL DEFAULT '',
     hash       TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (task_id, seq)
+);
+
+-- THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it is
+-- currently serving disagrees with what the operator approved. That decision is derived in memory
+-- from a LIVE OBSERVATION, and a process that has taken no observation has nothing to derive it
+-- from — a server nobody has looked at serves against the digest the operator wrote down, which is
+-- the declarative-approval behaviour every deployment without a live refresh depends on. Those two
+-- facts together are why this table exists: without it a restart hands a quarantined upstream its
+-- approval back until the next unattended sweep looks again.
+--
+-- ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
+-- demotion of one server replaces the row rather than standing a rival one beside it. Carries no
+-- secret: `reason` is an engine-chosen word for an operator to read, never caller text.
+--
+-- COLLATE \"C\" on `server`, for the reason `tasks.task_id` carries it and then some. This store does
+-- not get to choose the database it is pointed at, and one created with a NON-DETERMINISTIC ICU
+-- collation (LOCALE_PROVIDER icu ... DETERMINISTIC false) makes `=` case- and accent-insensitive —
+-- which here would let two DISTINCT registered upstreams collide on the primary key, so quarantining
+-- one would silently overwrite the other's record and clearing one would clear both. A registration
+-- id is an opaque operator-chosen string, not a word.
+CREATE TABLE IF NOT EXISTS mcp_demotions (
+    server      TEXT COLLATE \"C\" PRIMARY KEY,
+    reason      TEXT NOT NULL DEFAULT '',
+    recorded_at BIGINT NOT NULL
+);
+
+-- THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once tool
+-- execute once, and the seal itself cannot carry that property: the second presentation of a
+-- redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD THAT THE
+-- FIRST HAPPENED tells them apart, and in process memory that record dies with the process and is
+-- never shared with a second node — while two nodes of one deployment share the signing key, and
+-- therefore share the seal. Here it is one ledger for the whole cluster, which is the only place it
+-- can live and be true of both.
+--
+-- COLLATE \"C\" on `nonce` is the sharpest instance of the hazard in this file. Under a
+-- non-deterministic collation the primary key stops distinguishing a nonce from its case- or
+-- accent-variants, and a ledger whose entire job is telling one approval from another would then
+-- REFUSE a genuinely fresh approval (a false positive that breaks the gate for an operator) while
+-- folding an attacker's near-miss variants onto one row. Byte-exact is the only correct comparison
+-- for a random token, and it is stated rather than inherited.
+--
+-- No index beyond the primary key, and none is wanted: every redemption is a point lookup on
+-- `nonce` (the INSERT's own conflict check), and the only scan is the eviction sweep over a table
+-- bounded by one approval-validity window. `expires_at` is what that sweep goes by — an entry
+-- recording an approval that can no longer be opened protects nothing.
+CREATE TABLE IF NOT EXISTS spent_ask_states (
+    nonce      TEXT COLLATE \"C\" PRIMARY KEY,
+    expires_at BIGINT NOT NULL
 );
 ";
 
@@ -1690,6 +1744,97 @@ impl Store for PostgresStore {
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
+        // Refused rather than clamped, on the same reasoning `put_task` gives: `clamp` would pin a
+        // value above i64::MAX to i64::MAX and the row read back would not be the row written, with
+        // no error ever reported.
+        let recorded = as_storable_i64("put_mcp_demotion", "recorded_at", row.recorded_at)?;
+        // UPSERT BY server, as the trait requires: a second demotion of one upstream REPLACES the
+        // row rather than appending a rival one, so the boot read cannot come back holding two
+        // answers about one server.
+        self.lock()
+            .execute(
+                "INSERT INTO mcp_demotions (server, reason, recorded_at) VALUES ($1,$2,$3)
+                 ON CONFLICT (server) DO UPDATE SET
+                    reason=EXCLUDED.reason, recorded_at=EXCLUDED.recorded_at",
+                &[&row.server, &row.reason, &recorded],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
+        // The boot read that puts a demotion back in force before the first request is served. An
+        // EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" — a
+        // read failure surfaces as an Err, because a server with no row is a server nobody demoted,
+        // which is a different fact from a server that drifted, and conflating them would quarantine
+        // every declaratively-approved deployment at boot.
+        let rows = self
+            .lock()
+            .query(
+                "SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server",
+                &[],
+            )
+            .store()?;
+        Ok(rows
+            .iter()
+            .map(|r| McpDemotionRow {
+                server: r.get(0),
+                reason: r.get(1),
+                recorded_at: read_u64(r.get::<_, i64>(2)),
+            })
+            .collect())
+    }
+
+    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
+        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
+        // observation that agrees with the operator's approval rather than tracking whether it had
+        // demoted, so the overwhelmingly common call is one against no row at all.
+        self.lock()
+            .execute("DELETE FROM mcp_demotions WHERE server = $1", &[&server])
+            .store()?;
+        Ok(())
+    }
+
+    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+        // REFUSED rather than clamped, and this is the sharpest instance of that choice in the
+        // crate. `clamp` pins a `u64` above i64::MAX to i64::MAX; a `now` clamped that way would
+        // sweep the ENTIRE ledger below and then report the insert as a first redemption — i.e. one
+        // out-of-range argument would silently reopen every spent approval in the deployment. The
+        // engine's call site turns a store error into a REFUSED redemption, so an error is the
+        // direction to fail in, and a clamp is the direction that must never be taken here.
+        let expires = as_storable_i64("redeem_ask_state", "expires_at", expires_at)?;
+        let cutoff = as_storable_i64("redeem_ask_state", "now", now)?;
+
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        // The eviction sweep the redemption carries, so the table is bounded by one approval-validity
+        // window rather than growing forever: an entry recording an approval that can no longer be
+        // opened protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is kept
+        // — the same boundary convention every retention method in this crate uses. It runs BEFORE
+        // the insert, matching the reference implementation: sweeping afterwards could delete the
+        // row this very call just recorded.
+        tx.execute(
+            "DELETE FROM spent_ask_states WHERE expires_at < $1",
+            &[&cutoff],
+        )
+        .store()?;
+        // THE TEST AND SET, as ONE statement. `execute` returns the rows this INSERT actually wrote,
+        // so 1 means THIS call is the one that recorded the redemption and 0 means the row was
+        // already there. Reading the table and then writing it would tell BOTH halves of a race they
+        // were first — two nodes behind a load balancer, or two requests to one node — and that is
+        // precisely the shape this method is specified not to have.
+        let inserted = tx
+            .execute(
+                "INSERT INTO spent_ask_states (nonce, expires_at) VALUES ($1,$2)
+                 ON CONFLICT (nonce) DO NOTHING",
+                &[&nonce, &expires],
+            )
+            .store()?;
+        tx.commit().store()?;
+        Ok(inserted == 1)
     }
 }
 
