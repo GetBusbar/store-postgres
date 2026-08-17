@@ -51,7 +51,8 @@ JSON `open` config into a `PostgresStore` and hands the trait object to
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
 which emits the C ABI symbols the loader resolves. All the SQL and schema logic
 lives in the `busbar-store-postgres` library crate this plugin wraps, in the
-`busbarAI` monorepo — most substantive changes belong there, not here.
+`store-postgres/` directory of THIS repository, so most substantive changes
+belong there.
 
 ## Commit & PR conventions
 
