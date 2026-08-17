@@ -61,7 +61,7 @@ fn is_undefined_table(e: &postgres::Error) -> bool {
     e.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
-/// Extract the PASSWORD from a Postgres DSN (L2). Supports both the URL form
+/// Extract the PASSWORD from a Postgres DSN. Supports both the URL form
 /// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
 /// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
 fn dsn_password(dsn: &str) -> Option<String> {

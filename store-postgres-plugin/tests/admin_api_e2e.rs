@@ -40,6 +40,8 @@
 //! Together: real admin-API install -> real (admin-API-driven) plugin load -> real admin-API write
 //! -> real, independently-verified Postgres persistence.
 
+mod common;
+
 use base64::Engine as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -80,9 +82,8 @@ fn postgres_url() -> Option<String> {
 /// Checks BOTH the "uplifted" `<profile_dir>/<name>` copy (only refreshed when `[lib]` is a ROOT
 /// build target of the invocation, e.g. `cargo build --all-targets`) and the raw
 /// `<profile_dir>/deps/<name>` compiler output (refreshed on every build that recompiles the lib,
-/// uplifted or not). A bare `cargo test --release` (what `release-check.sh`'s Phase 2 runs, and what
-/// cargo-mutants runs) does NOT uplift the cdylib to the top-level profile dir, only to
-/// `target/deps` — checking only `profile_dir` silently finds nothing and this test's CI hard-panic
+/// uplifted or not). A bare `cargo test --release` (what `release-check.sh`'s Phase 2 runs) does
+/// NOT uplift the cdylib to the top-level profile dir, only to `target/deps` — checking only `profile_dir` silently finds nothing and this test's CI hard-panic
 /// fires even though the cdylib really was built (confirmed against `release-check.sh`'s CI run:
 /// "the store-postgres-plugin cdylib is not built under CI" despite the prior `cargo test
 /// --workspace --release` step compiling it). Same fix already applied to auth-oidc-plugin's and
@@ -287,7 +288,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let config1 = work.join("config1.yaml");
     std::fs::write(&config1, &providers_and_common).unwrap();
 
-    let child1 = Command::new(&busbar_bin)
+    let mut boot1 = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut boot1, &[&config1, &providers]);
+    let child1 = boot1
         .env("BUSBAR_CONFIG", &config1)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
@@ -381,7 +384,9 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     )
     .unwrap();
 
-    let child2 = Command::new(&busbar_bin)
+    let mut boot2 = Command::new(&busbar_bin);
+    common::apply_placeholder_secrets_from_files(&mut boot2, &[&config2, &providers]);
+    let child2 = boot2
         .env("BUSBAR_CONFIG", &config2)
         .env("BUSBAR_PROVIDERS", &providers)
         .env("BUSBAR_ADMIN_TOKEN", admin_token)
