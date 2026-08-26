@@ -4,6 +4,7 @@
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/store-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-postgres/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/GetBusbar/store-postgres/branch/main/graph/badge.svg)](https://codecov.io/gh/GetBusbar/store-postgres)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/store-postgres)](https://github.com/GetBusbar/store-postgres/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
