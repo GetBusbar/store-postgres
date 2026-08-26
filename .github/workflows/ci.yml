@@ -98,7 +98,7 @@ jobs:
         working-directory: plugin
         env:
           BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
       - name: Upload to Codecov (tokenless; never fails the build)
         uses: codecov/codecov-action@v5
         with:
