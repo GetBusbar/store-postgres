@@ -36,3 +36,72 @@ jobs:
       # `cargo test` step above (working-directory: plugin, a workspace covering both
       # `busbar-store-postgres` and `busbar-store-postgres-plugin`) already exercises it in full,
       # so the sibling-checkout step would now fail (no such package) and is redundant besides.
+
+  # ── coverage: ADDITIVE and INFORMATIONAL. Runs llvm-cov over this repo's workspace and uploads to
+  # Codecov. It is NOT part of the required `ci` gate above (Codecov is configured informational in
+  # codecov.yml and this job never fail_ci_if_error), so a coverage hiccup can never block a PR.
+  #
+  # It mirrors the reusable plugin-ci.yml's setup exactly, because this repo's workspace has path
+  # dependencies into a SIBLING busbarAI checkout (busbar-api / busbar-plugin-sdk / plugin-loader /
+  # plugin-testkit): the plugin is checked out to `plugin/` and GetBusbar/busbar to `busbarAI/`, so
+  # `plugin/store-postgres/../../busbarAI` resolves to that sibling — the same layout `cargo test`
+  # uses. It boots the same digest-pinned postgres:16 service container and sets the same
+  # BUSBAR_TEST_POSTGRES_URL, so the live-DB roundtrip tests run under coverage rather than skipping.
+  coverage:
+    name: coverage (llvm-cov · codecov)
+    runs-on: ubuntu-latest
+    # Copied from the reference coverage job: run on every PR/dispatch, and on push only to the
+    # protected branches this repo builds on. On a PR, github.base_ref is the target branch, so the
+    # sibling busbarAI checkout below always resolves to an existing branch (main/dev/qa).
+    if: github.event_name != 'push' || contains(fromJSON('["refs/heads/main", "refs/heads/dev", "refs/heads/qa"]'), github.ref)
+    services:
+      postgres:
+        image: postgres:16@sha256:95206741a5b214807675e14165369d05b93a9cf692223b616d07cca227e74b0b
+        env:
+          POSTGRES_USER: busbar
+          POSTGRES_PASSWORD: busbar
+          POSTGRES_DB: busbar_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U busbar"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout the plugin (this repo's workspace)
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ github.base_ref || github.ref_name }}
+          path: busbarAI
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Both Cargo workspaces live under path: checkouts, so neither is at $GITHUB_WORKSPACE —
+          # list both explicitly or the cache silently no-ops (see plugin-ci.yml's note).
+          workspaces: |
+            plugin
+            busbarAI
+          key: coverage-${{ github.base_ref || github.ref_name }}
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect coverage (workspace, live-DB tests wired)
+        working-directory: plugin
+        env:
+          BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov (tokenless; never fails the build)
+        uses: codecov/codecov-action@v5
+        with:
+          files: plugin/lcov.info
+          slug: GetBusbar/store-postgres
+          fail_ci_if_error: false
